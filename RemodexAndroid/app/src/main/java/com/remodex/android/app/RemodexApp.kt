@@ -18,7 +18,6 @@ import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -35,7 +34,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -57,7 +55,6 @@ import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -110,6 +107,7 @@ import com.remodex.android.ui.component.RemodexBrandIcon
 import com.remodex.android.ui.component.SidebarContent
 import com.remodex.android.ui.component.StructuredInputCard
 import com.remodex.android.ui.component.UsageStatusSheetContent
+import com.remodex.android.ui.onboarding.OnboardingScreen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -123,13 +121,14 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
     val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val voiceManager = remember(context) { VoiceRecordingManager(context.applicationContext) }
+    var showOnboarding by rememberSaveable { mutableStateOf(!viewModel.hasCompletedOnboarding()) }
     var showScanner by rememberSaveable { mutableStateOf(!uiState.hasSavedPairing) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var showDiffSheet by rememberSaveable { mutableStateOf(false) }
     var showBranchSelector by rememberSaveable { mutableStateOf(false) }
     var showGitActions by rememberSaveable { mutableStateOf(false) }
     var showUsageStatusSheet by rememberSaveable { mutableStateOf(false) }
-    var manualPairingCode by rememberSaveable { mutableStateOf("") }
+    var sidebarProjectOrder by rememberSaveable { mutableStateOf(viewModel.sidebarProjectOrder()) }
 
     // Lifecycle observer for foreground/background tracking
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -168,6 +167,15 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
         color = MaterialTheme.colorScheme.background,
     ) {
         when {
+            showOnboarding -> {
+                OnboardingScreen(
+                    onFinished = {
+                        viewModel.setOnboardingCompleted()
+                        showOnboarding = false
+                    },
+                )
+            }
+
             showSettings -> {
                 com.remodex.android.ui.screen.SettingsScreen(
                     uiState = uiState,
@@ -182,20 +190,13 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
             }
 
             !uiState.hasSavedPairing || showScanner -> {
-                PairingScreen(
-                    uiState = uiState,
-                    pairingFeedback = viewModel.pairingFeedback,
-                    manualPairingCode = manualPairingCode,
-                    onManualPairingCodeChanged = {
-                        manualPairingCode = it
-                        viewModel.clearPairingFeedback()
-                    },
-                    onSubmitManualCode = { viewModel.onPairingCodeSubmitted(manualPairingCode) },
-                    onScanned = {
-                        manualPairingCode = it
-                        viewModel.onPairingCodeSubmitted(it)
-                    },
-                    onReconnect = viewModel::reconnect,
+                    PairingScreen(
+                        uiState = uiState,
+                        pairingFeedback = viewModel.pairingFeedback,
+                        onScanned = {
+                            viewModel.onPairingCodeSubmitted(it)
+                        },
+                        onReconnect = viewModel::reconnect,
                     onDismissScanner = { showScanner = false },
                 )
             }
@@ -210,8 +211,13 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                         ) {
                             SidebarContent(
                                 uiState = uiState,
-                                onNewChat = {
-                                    viewModel.startThread()
+                                projectOrder = sidebarProjectOrder,
+                                onProjectOrderChanged = { nextOrder ->
+                                    sidebarProjectOrder = nextOrder
+                                    viewModel.saveSidebarProjectOrder(nextOrder)
+                                },
+                                onStartThreadInProject = { projectPath ->
+                                    viewModel.startThread(projectPath)
                                     scope.launch { drawerState.close() }
                                 },
                                 onSelectThread = {
@@ -240,7 +246,7 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                                 title = {
                                     Column {
                                         Text(
-                                            selectedThread?.title ?: "Remodex",
+                                            selectedThread?.title ?: "Dex",
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,
                                             style = MaterialTheme.typography.titleMedium,
@@ -770,15 +776,11 @@ private fun appendVoiceTranscript(draft: String, transcript: String): String {
 private fun PairingScreen(
     uiState: com.remodex.android.core.model.RemodexUiState,
     pairingFeedback: String?,
-    manualPairingCode: String,
-    onManualPairingCodeChanged: (String) -> Unit,
-    onSubmitManualCode: () -> Unit,
     onScanned: (String) -> Unit,
     onReconnect: () -> Unit,
     onDismissScanner: () -> Unit,
 ) {
     var scannerExpanded by rememberSaveable { mutableStateOf(true) }
-    var showManualEntry by rememberSaveable { mutableStateOf(false) }
     val isConnecting = uiState.connectionState == RelayConnectionState.CONNECTING ||
         uiState.connectionState == RelayConnectionState.HANDSHAKING
 
@@ -792,23 +794,16 @@ private fun PairingScreen(
         Spacer(Modifier.height(80.dp))
 
         // App icon
-        Box(
+        RemodexBrandIcon(
             modifier = Modifier
-                .size(72.dp)
-                .background(MaterialTheme.colorScheme.primary, CircleShape),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                ">_",
-                style = MaterialTheme.typography.headlineMedium,
-                color = MaterialTheme.colorScheme.onPrimary,
-            )
-        }
+                .size(72.dp),
+            contentDescription = "Remodex app icon",
+        )
 
         Spacer(Modifier.height(20.dp))
 
         Text(
-            "Remodex",
+            "Dex",
             style = MaterialTheme.typography.headlineLarge,
         )
 
@@ -932,68 +927,68 @@ private fun PairingScreen(
 
         Spacer(Modifier.height(24.dp))
 
-        // Manual code entry (collapsible)
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 24.dp),
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { showManualEntry = !showManualEntry }
-                    .padding(vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "Paste pairing code",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.weight(1f))
-                Text(
-                    if (showManualEntry) "Hide" else "Show",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-            }
-
-            AnimatedVisibility(showManualEntry) {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(
-                        value = manualPairingCode,
-                        onValueChange = onManualPairingCodeChanged,
-                        modifier = Modifier.fillMaxWidth(),
-                        minLines = 3,
-                        maxLines = 6,
-                        placeholder = {
-                            Text(
-                                """{"v":2,"relay":"ws://..."}""",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
-                            )
-                        },
-                        shape = RoundedCornerShape(12.dp),
-                    )
-                    Button(
-                        onClick = onSubmitManualCode,
-                        enabled = manualPairingCode.isNotBlank() && !isConnecting,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
-                    ) {
-                        if (isConnecting) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp),
-                                strokeWidth = 2.dp,
-                                color = MaterialTheme.colorScheme.onPrimary,
-                            )
-                            Spacer(Modifier.width(8.dp))
-                        }
-                        Text("Connect")
-                    }
-                }
-            }
-        }
+//        // Manual code entry (collapsible)
+//        Column(
+//            modifier = Modifier
+//                .fillMaxWidth()
+//                .padding(horizontal = 24.dp),
+//        ) {
+//            Row(
+//                modifier = Modifier
+//                    .fillMaxWidth()
+//                    .clickable { showManualEntry = !showManualEntry }
+//                    .padding(vertical = 8.dp),
+//                verticalAlignment = Alignment.CenterVertically,
+//            ) {
+//                Text(
+//                    "Paste pairing code",
+//                    style = MaterialTheme.typography.titleSmall,
+//                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+//                )
+//                Spacer(Modifier.weight(1f))
+//                Text(
+//                    if (showManualEntry) "Hide" else "Show",
+//                    style = MaterialTheme.typography.labelMedium,
+//                    color = MaterialTheme.colorScheme.primary,
+//                )
+//            }
+//
+//            AnimatedVisibility(showManualEntry) {
+//                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+//                    OutlinedTextField(
+//                        value = manualPairingCode,
+//                        onValueChange = onManualPairingCodeChanged,
+//                        modifier = Modifier.fillMaxWidth(),
+//                        minLines = 3,
+//                        maxLines = 6,
+//                        placeholder = {
+//                            Text(
+//                                """{"v":2,"relay":"ws://..."}""",
+//                                style = MaterialTheme.typography.bodySmall,
+//                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+//                            )
+//                        },
+//                        shape = RoundedCornerShape(12.dp),
+//                    )
+//                    Button(
+//                        onClick = onSubmitManualCode,
+//                        enabled = manualPairingCode.isNotBlank() && !isConnecting,
+//                        modifier = Modifier.fillMaxWidth(),
+//                        shape = RoundedCornerShape(12.dp),
+//                    ) {
+//                        if (isConnecting) {
+//                            CircularProgressIndicator(
+//                                modifier = Modifier.size(16.dp),
+//                                strokeWidth = 2.dp,
+//                                color = MaterialTheme.colorScheme.onPrimary,
+//                            )
+//                            Spacer(Modifier.width(8.dp))
+//                        }
+//                        Text("Connect")
+//                    }
+//                }
+//            }
+//        }
 
         Spacer(Modifier.height(40.dp))
 
@@ -1064,8 +1059,13 @@ private fun QrScannerView(onDetected: (String) -> Unit) {
         }
     }
 
-    DisposableEffect(permissionGranted, lifecycleOwner, previewView) {
+    DisposableEffect(permissionGranted, previewView, handled) {
         if (!permissionGranted) {
+            onDispose { }
+        } else if (handled) {
+            if (cameraProviderFuture.isDone) {
+                runCatching { cameraProviderFuture.get().unbindAll() }
+            }
             onDispose { }
         } else {
             val executor = ContextCompat.getMainExecutor(context)
@@ -1092,6 +1092,7 @@ private fun QrScannerView(onDetected: (String) -> Unit) {
                             val raw = barcodes.firstNotNullOfOrNull { it.rawValue }
                             if (!handled && raw != null) {
                                 handled = true
+                                runCatching { cameraProvider.unbindAll() }
                                 latestOnDetected(raw)
                             }
                         }

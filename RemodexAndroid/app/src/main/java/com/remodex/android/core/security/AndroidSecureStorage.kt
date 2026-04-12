@@ -52,6 +52,26 @@ class AndroidSecureStorage(context: Context, private val json: Json) {
         writePlain(KEY_LAST_TRUSTED_MAC_DEVICE_ID, value)
     }
 
+    fun hasCompletedOnboarding(): Boolean = prefs.getBoolean(KEY_ONBOARDING_COMPLETED, false)
+
+    fun setOnboardingCompleted() {
+        prefs.edit().putBoolean(KEY_ONBOARDING_COMPLETED, true).apply()
+    }
+
+    fun readSidebarProjectOrder(): List<String> {
+        return readPlain(KEY_SIDEBAR_PROJECT_ORDER)
+            ?.split('\n')
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.distinct()
+            ?: emptyList()
+    }
+
+    fun writeSidebarProjectOrder(value: List<String>) {
+        val normalized = value.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        writePlain(KEY_SIDEBAR_PROJECT_ORDER, normalized.joinToString("\n"))
+    }
+
     fun clearRelayState() {
         prefs.edit()
             .remove(KEY_RELAY_SESSION)
@@ -125,5 +145,7 @@ class AndroidSecureStorage(context: Context, private val json: Json) {
         const val KEY_RELAY_SESSION = "relay_session"
         const val KEY_TRUSTED_REGISTRY = "trusted_registry"
         const val KEY_LAST_TRUSTED_MAC_DEVICE_ID = "last_trusted_mac_device_id"
+        const val KEY_ONBOARDING_COMPLETED = "onboarding_completed"
+        const val KEY_SIDEBAR_PROJECT_ORDER = "sidebar_project_order"
     }
 }

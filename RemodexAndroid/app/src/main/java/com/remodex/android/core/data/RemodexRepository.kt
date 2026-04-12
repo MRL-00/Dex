@@ -219,21 +219,52 @@ class RemodexRepository(
             ?: root["threads"].jsonArrayOrNull()
             ?: JsonArray(emptyList())
         val threads = page.mapNotNull { it.jsonObjectOrNull()?.let(::threadSummaryFromJson) }
-        _uiState.update {
-            it.copy(
+        var selectedThreadIdToRefresh: String? = null
+        _uiState.update { state ->
+            val resolvedSelectedThreadId = when {
+                state.selectedThreadId != null && threads.any { thread -> thread.id == state.selectedThreadId } -> {
+                    state.selectedThreadId
+                }
+                else -> threads.firstOrNull()?.id
+            }
+            val hasCachedMessages = resolvedSelectedThreadId?.let { threadId ->
+                state.messagesByThread[threadId].orEmpty().isNotEmpty()
+            } == true
+            val shouldRefreshSelectedThread = resolvedSelectedThreadId != null &&
+                (resolvedSelectedThreadId != state.selectedThreadId || !hasCachedMessages)
+            if (shouldRefreshSelectedThread) {
+                selectedThreadIdToRefresh = resolvedSelectedThreadId
+            }
+            state.copy(
                 threads = threads,
-                selectedThreadId = it.selectedThreadId ?: threads.firstOrNull()?.id,
+                selectedThreadId = resolvedSelectedThreadId,
+                loadingThreadIds = when {
+                    resolvedSelectedThreadId == null -> state.loadingThreadIds
+                    hasCachedMessages -> state.loadingThreadIds - resolvedSelectedThreadId
+                    else -> state.loadingThreadIds + resolvedSelectedThreadId
+                },
             )
         }
         gitCoordinator.prefetchGitStatusForThreads(threads)
+        selectedThreadIdToRefresh?.let(::requestThreadHistoryRefresh)
     }
+
+    fun hasCompletedOnboarding(): Boolean = storage.hasCompletedOnboarding()
+
+    fun setOnboardingCompleted() = storage.setOnboardingCompleted()
 
     fun setErrorMessage(message: String?) {
         _uiState.update { it.copy(errorMessage = message) }
     }
 
-    suspend fun startThread() {
-        val response = sendRequest("thread/start", JsonObject(emptyMap()))
+    suspend fun startThread(preferredProjectPath: String? = null) {
+        val params = buildMap<String, JsonElement> {
+            preferredProjectPath
+                ?.trim()
+                ?.takeIf(String::isNotEmpty)
+                ?.let { put("cwd", JsonPrimitive(it)) }
+        }
+        val response = sendRequest("thread/start", JsonObject(params))
         val thread = response.result.jsonObjectOrNull()
             ?.get("thread")
             ?.jsonObjectOrNull()
@@ -245,6 +276,12 @@ class RemodexRepository(
                 selectedThreadId = thread.id,
             )
         }
+    }
+
+    fun readSidebarProjectOrder(): List<String> = storage.readSidebarProjectOrder()
+
+    fun writeSidebarProjectOrder(order: List<String>) {
+        storage.writeSidebarProjectOrder(order)
     }
 
     suspend fun openThread(threadId: String) {

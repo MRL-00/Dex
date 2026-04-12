@@ -37,6 +37,10 @@ class RemodexAppViewModel(
         private set
     private val transcriptionClient = GptTranscriptionClient()
 
+    fun hasCompletedOnboarding(): Boolean = repository.hasCompletedOnboarding()
+
+    fun setOnboardingCompleted() = repository.setOnboardingCompleted()
+
     fun reconnect() {
         pairingFeedback = null
         viewModelScope.launch(exceptionHandler) {
@@ -88,6 +92,18 @@ class RemodexAppViewModel(
         viewModelScope.launch(exceptionHandler) {
             repository.startThread()
         }
+    }
+
+    fun startThread(preferredProjectPath: String?) {
+        viewModelScope.launch(exceptionHandler) {
+            repository.startThread(preferredProjectPath)
+        }
+    }
+
+    fun sidebarProjectOrder(): List<String> = repository.readSidebarProjectOrder()
+
+    fun saveSidebarProjectOrder(order: List<String>) {
+        repository.writeSidebarProjectOrder(order)
     }
 
     fun sendTurn(threadId: String, text: String, attachments: List<ImageAttachment> = emptyList()) {

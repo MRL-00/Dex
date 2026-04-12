@@ -439,6 +439,6 @@ internal class RemodexRealtimeCoordinator(
     }
 
     private fun threadTitle(threadId: String): String {
-        return uiState.value.threads.find { it.id == threadId }?.title ?: "Remodex"
+        return uiState.value.threads.find { it.id == threadId }?.title ?: "Dex"
     }
 }
