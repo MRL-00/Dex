@@ -209,30 +209,68 @@ data class ThreadSummary(
     val isArchived: Boolean,
 )
 
+@Serializable
 enum class MessageRole {
     USER,
     ASSISTANT,
     SYSTEM,
 }
 
+@Serializable
 enum class MessageKind {
     CHAT,
     THINKING,
     TOOL_ACTIVITY,
+    COMMAND_EXECUTION,
     APPROVAL,
 }
 
+@Serializable
 data class ConversationMessage(
     val id: String,
     val threadId: String,
     val role: MessageRole,
     val kind: MessageKind = MessageKind.CHAT,
     val text: String,
+    val attachments: List<ImageAttachment> = emptyList(),
     val turnId: String? = null,
     val itemId: String? = null,
     val isStreaming: Boolean = false,
     val createdAtMillis: Long = System.currentTimeMillis(),
 )
+
+fun namespacedConversationMessageId(
+    rawId: String,
+    role: MessageRole,
+    kind: MessageKind,
+): String {
+    val prefix = when (kind) {
+        MessageKind.THINKING -> "thinking"
+        MessageKind.TOOL_ACTIVITY -> "tool"
+        MessageKind.COMMAND_EXECUTION -> "command"
+        MessageKind.APPROVAL -> "approval"
+        MessageKind.CHAT -> when (role) {
+            MessageRole.USER -> "user"
+            MessageRole.ASSISTANT -> "assistant"
+            MessageRole.SYSTEM -> "system"
+        }
+    }
+    return if (rawId.startsWith("$prefix-")) rawId else "$prefix-$rawId"
+}
+
+fun ConversationMessage.timelineLazyKey(index: Int): String {
+    return buildString {
+        append(namespacedConversationMessageId(id, role, kind))
+        append('|')
+        append(itemId ?: "")
+        append('|')
+        append(turnId ?: "")
+        append('|')
+        append(createdAtMillis)
+        append('|')
+        append(index)
+    }
+}
 
 data class PendingApproval(
     val requestKey: String,
@@ -263,6 +301,7 @@ data class RemodexUiState(
     val threads: List<ThreadSummary> = emptyList(),
     val selectedThreadId: String? = null,
     val messagesByThread: Map<String, List<ConversationMessage>> = emptyMap(),
+    val loadingThreadIds: Set<String> = emptySet(),
     val activeTurnIdByThread: Map<String, String> = emptyMap(),
     val runningThreadIds: Set<String> = emptySet(),
     val pendingApproval: PendingApproval? = null,
@@ -272,11 +311,17 @@ data class RemodexUiState(
     val structuredInputRequests: List<StructuredUserInputRequest> = emptyList(),
     // Git
     val gitStatus: GitRepoSyncResult? = null,
+    val gitStatusByThread: Map<String, GitRepoSyncResult> = emptyMap(),
     val gitBranches: GitBranchesResult? = null,
     // Runtime config
     val availableModels: List<ModelOption> = emptyList(),
     val runtimeOverrideByThread: Map<String, ThreadRuntimeOverride> = emptyMap(),
     val selectedAccessMode: AccessMode = AccessMode.ON_REQUEST,
+    val contextWindowUsageByThread: Map<String, ContextWindowUsage> = emptyMap(),
+    val rateLimitBuckets: List<RateLimitBucket> = emptyList(),
+    val isLoadingRateLimits: Boolean = false,
+    val rateLimitsErrorMessage: String? = null,
+    val hasResolvedRateLimitsSnapshot: Boolean = false,
     // Notifications
     val pendingNotificationThreadId: String? = null,
 )
@@ -285,10 +330,10 @@ fun JsonObject.stringOrNull(vararg keys: String): String? {
     for (key in keys) {
         val value = this[key] as? JsonPrimitive ?: continue
         if (value.isString) {
-            return value.content.takeIf { it.isNotBlank() }
+            return value.content.takeIf { it.isNotBlank() && it != "null" }
         }
         val content = value.content
-        if (content.isNotBlank()) {
+        if (content.isNotBlank() && content != "null") {
             return content
         }
     }
@@ -331,12 +376,19 @@ fun threadSummaryFromJson(payload: JsonObject): ThreadSummary? {
     val title = payload.stringOrNull("name", "title")
         ?: payload.stringOrNull("preview")
         ?: "New Thread"
+    val rawTimestamp = payload.longOrNull("updatedAt", "updated_at")
+    // Normalize: if the value looks like seconds (< 10 billion), convert to millis.
+    val updatedAtMillis = when {
+        rawTimestamp == null -> null
+        rawTimestamp < 10_000_000_000L -> rawTimestamp * 1000L
+        else -> rawTimestamp
+    }
     return ThreadSummary(
         id = id,
         title = title,
         preview = payload.stringOrNull("preview"),
         cwd = payload.stringOrNull("cwd", "current_working_directory", "working_directory"),
-        updatedAtMillis = payload.longOrNull("updatedAt", "updated_at"),
+        updatedAtMillis = updatedAtMillis,
         isArchived = payload.boolOrNull("archived") ?: false,
     )
 }

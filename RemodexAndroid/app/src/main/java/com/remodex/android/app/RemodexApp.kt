@@ -2,7 +2,11 @@ package com.remodex.android.app
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.net.Uri
 import android.util.Size
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -23,11 +27,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -47,6 +52,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.CircularProgressIndicator
@@ -58,12 +64,14 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -73,6 +81,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -83,7 +92,12 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
+import com.remodex.android.core.attachment.ImageAttachmentPipeline
+import com.remodex.android.core.model.ImageAttachment
 import com.remodex.android.core.model.RelayConnectionState
+import com.remodex.android.core.model.timelineLazyKey
+import com.remodex.android.core.voice.VoicePreflightResult
+import com.remodex.android.core.voice.VoiceRecordingManager
 import com.remodex.android.ui.component.ApprovalCard
 import com.remodex.android.ui.component.ComposerBar
 import com.remodex.android.ui.component.DiffStatsBadge
@@ -92,9 +106,13 @@ import com.remodex.android.ui.component.GitBranchSelector
 import com.remodex.android.ui.component.GitDiffSheet
 import com.remodex.android.ui.component.MessageBubble
 import com.remodex.android.ui.component.PlanCard
+import com.remodex.android.ui.component.RemodexBrandIcon
 import com.remodex.android.ui.component.SidebarContent
 import com.remodex.android.ui.component.StructuredInputCard
+import com.remodex.android.ui.component.UsageStatusSheetContent
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -102,11 +120,15 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val voiceManager = remember(context) { VoiceRecordingManager(context.applicationContext) }
     var showScanner by rememberSaveable { mutableStateOf(!uiState.hasSavedPairing) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var showDiffSheet by rememberSaveable { mutableStateOf(false) }
     var showBranchSelector by rememberSaveable { mutableStateOf(false) }
     var showGitActions by rememberSaveable { mutableStateOf(false) }
+    var showUsageStatusSheet by rememberSaveable { mutableStateOf(false) }
     var manualPairingCode by rememberSaveable { mutableStateOf("") }
 
     // Lifecycle observer for foreground/background tracking
@@ -125,6 +147,20 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
 
     LaunchedEffect(uiState.isConnected) {
         if (uiState.isConnected) showScanner = false
+    }
+
+    // Auto-fetch git status when selected thread changes
+    val selectedCwd = uiState.selectedThreadId?.let { tid ->
+        uiState.threads.find { it.id == tid }?.cwd
+    }
+    val selectedGitStatus = uiState.selectedThreadId?.let { uiState.gitStatusByThread[it] } ?: uiState.gitStatus
+    val shouldShowErrorBanner = uiState.errorMessage != null &&
+        uiState.connectionState != RelayConnectionState.CONNECTING &&
+        uiState.connectionState != RelayConnectionState.HANDSHAKING
+    LaunchedEffect(selectedCwd, uiState.isConnected) {
+        if (uiState.isConnected && selectedCwd != null) {
+            viewModel.gitStatus(selectedCwd)
+        }
     }
 
     Surface(
@@ -227,9 +263,9 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                                 },
                                 actions = {
                                     // Diff stats badge
-                                    if (cwd != null && uiState.gitStatus != null) {
+                                    if (cwd != null && selectedGitStatus != null) {
                                         DiffStatsBadge(
-                                            gitStatus = uiState.gitStatus,
+                                            gitStatus = selectedGitStatus,
                                             onClick = {
                                                 viewModel.gitDiff(cwd)
                                                 showDiffSheet = true
@@ -257,15 +293,28 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                         val messages = threadId?.let { uiState.messagesByThread[it].orEmpty() }.orEmpty()
                         val isRunning = threadId != null && threadId in uiState.runningThreadIds
                         val planState = threadId?.let { uiState.planStateByThread[it] }
+                        val contextWindowUsage = threadId?.let(uiState.contextWindowUsageByThread::get)
+                        val shouldAutoRefreshUsageStatus = threadId != null &&
+                            uiState.isConnected &&
+                            (contextWindowUsage == null || !uiState.hasResolvedRateLimitsSnapshot)
                         var draft by rememberSaveable(threadId) { mutableStateOf("") }
+                        var composerAttachments by remember(threadId) { mutableStateOf(emptyList<ImageAttachment>()) }
+                        var isVoiceRecording by remember(threadId) { mutableStateOf(false) }
+
+                        LaunchedEffect(threadId, uiState.isConnected) {
+                            if (threadId != null && shouldAutoRefreshUsageStatus) {
+                                viewModel.refreshUsageStatus(threadId)
+                            }
+                        }
 
                         Column(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .padding(innerPadding),
+                                .padding(innerPadding)
+                                .imePadding(),
                         ) {
                             // Error banner
-                            AnimatedVisibility(uiState.errorMessage != null) {
+                            AnimatedVisibility(shouldShowErrorBanner) {
                                 Card(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -292,21 +341,11 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                                 // Empty state
                                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                        Box(
+                                        RemodexBrandIcon(
                                             modifier = Modifier
-                                                .size(64.dp)
-                                                .background(
-                                                    MaterialTheme.colorScheme.primaryContainer,
-                                                    CircleShape,
-                                                ),
-                                            contentAlignment = Alignment.Center,
-                                        ) {
-                                            Text(
-                                                ">_",
-                                                style = MaterialTheme.typography.headlineMedium,
-                                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                            )
-                                        }
+                                                .size(72.dp),
+                                            contentDescription = "Remodex app icon",
+                                        )
                                         Spacer(Modifier.height(16.dp))
                                         Text(
                                             "Hi! How can I help?",
@@ -374,59 +413,186 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                                     )
                                 }
 
+                                val imagePickerLauncher = rememberLauncherForActivityResult(
+                                    contract = ActivityResultContracts.GetMultipleContents(),
+                                ) { uris ->
+                                    if (uris.isEmpty()) return@rememberLauncherForActivityResult
+                                    scope.launch {
+                                        val remainingSlots = (ImageAttachmentPipeline.maxComposerImages - composerAttachments.size)
+                                            .coerceAtLeast(0)
+                                        if (remainingSlots == 0) {
+                                            return@launch
+                                        }
+                                        val nextAttachments = loadComposerAttachmentsFromUris(
+                                            context = context,
+                                            uris = uris.take(remainingSlots),
+                                        )
+                                        if (nextAttachments.isNotEmpty()) {
+                                            composerAttachments = composerAttachments + nextAttachments
+                                        } else {
+                                            viewModel.setErrorMessage("Couldn't attach those images.")
+                                        }
+                                    }
+                                }
+                                val cameraPreviewLauncher = rememberLauncherForActivityResult(
+                                    contract = ActivityResultContracts.TakePicturePreview(),
+                                ) { bitmap ->
+                                    if (bitmap == null) return@rememberLauncherForActivityResult
+                                    scope.launch {
+                                        val attachment = buildComposerAttachmentFromBitmap(bitmap)
+                                        if (attachment != null) {
+                                            composerAttachments = composerAttachments + attachment
+                                        } else {
+                                            viewModel.setErrorMessage("Couldn't attach that photo.")
+                                        }
+                                    }
+                                }
+                                val voicePermissionLauncher = rememberLauncherForActivityResult(
+                                    contract = ActivityResultContracts.RequestPermission(),
+                                ) { granted ->
+                                    if (!granted) return@rememberLauncherForActivityResult
+                                    keyboardController?.hide()
+                                    isVoiceRecording = voiceManager.startRecording()
+                                    if (!isVoiceRecording) {
+                                        viewModel.setErrorMessage("Microphone unavailable right now.")
+                                    }
+                                }
+
+                                DisposableEffect(threadId) {
+                                    onDispose {
+                                        if (isVoiceRecording) {
+                                            voiceManager.cancelRecording()
+                                        }
+                                    }
+                                }
+
                                 // Message timeline
                                 val listState = rememberLazyListState()
+                                var lastAutoScrollMessageCount by remember(threadId) { mutableStateOf(0) }
                                 LaunchedEffect(messages.size) {
                                     if (messages.isNotEmpty()) {
-                                        listState.animateScrollToItem(messages.size - 1)
+                                        val targetIndex = messages.size - 1
+                                        if (lastAutoScrollMessageCount == 0 || messages.size - lastAutoScrollMessageCount > 6) {
+                                            listState.scrollToItem(targetIndex)
+                                        } else {
+                                            listState.animateScrollToItem(targetIndex)
+                                        }
+                                        lastAutoScrollMessageCount = messages.size
                                     }
                                 }
 
                                 // Loading spinner when thread is selected but messages haven't arrived
-                                if (messages.isEmpty() && !isRunning) {
+                                if (messages.isEmpty() && threadId in uiState.loadingThreadIds && !isRunning) {
                                     Box(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .padding(vertical = 24.dp),
+                                            .weight(1f)
+                                            .padding(24.dp),
                                         contentAlignment = Alignment.Center,
                                     ) {
-                                        CircularProgressIndicator(
-                                            modifier = Modifier.size(24.dp),
-                                            strokeWidth = 2.dp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
-                                        )
+                                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                            RemodexBrandIcon(
+                                                modifier = Modifier.size(56.dp),
+                                                contentDescription = "Remodex app icon",
+                                            )
+                                            Spacer(Modifier.height(18.dp))
+                                            CircularProgressIndicator(
+                                                modifier = Modifier.size(24.dp),
+                                                strokeWidth = 2.dp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                                            )
+                                        }
                                     }
-                                }
-
-                                LazyColumn(
-                                    state = listState,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .padding(horizontal = 12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                                ) {
-                                    items(messages, key = { it.id }) { message ->
-                                        MessageBubble(message)
+                                } else {
+                                    LazyColumn(
+                                        state = listState,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .padding(horizontal = 12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        itemsIndexed(
+                                            items = messages,
+                                            key = { index, message -> message.timelineLazyKey(index) },
+                                        ) { _, message ->
+                                            MessageBubble(message)
+                                        }
                                     }
                                 }
 
                                 // Composer with integrated controls
                                 ComposerBar(
                                     draft = draft,
+                                    attachments = composerAttachments,
                                     onDraftChange = { draft = it },
                                     onSend = {
-                                        if (draft.isNotBlank()) {
-                                            viewModel.sendTurn(threadId, draft)
+                                        if (draft.isNotBlank() || composerAttachments.isNotEmpty()) {
+                                            viewModel.sendTurn(threadId, draft, composerAttachments)
                                             draft = ""
+                                            composerAttachments = emptyList()
                                         }
                                     },
                                     onInterrupt = { viewModel.interruptTurn(threadId) },
                                     isRunning = isRunning,
                                     isConnected = uiState.isConnected,
+                                    onPickImage = {
+                                        keyboardController?.hide()
+                                        imagePickerLauncher.launch("image/*")
+                                    },
+                                    onTakePhoto = {
+                                        keyboardController?.hide()
+                                        if (composerAttachments.size < ImageAttachmentPipeline.maxComposerImages) {
+                                            cameraPreviewLauncher.launch(null)
+                                        }
+                                    },
+                                    onRemoveAttachment = { attachmentId ->
+                                        composerAttachments = composerAttachments.filterNot { it.id == attachmentId }
+                                    },
+                                    onVoice = {
+                                        if (!viewModel.voiceTranscribing) {
+                                            if (isVoiceRecording) {
+                                                scope.launch {
+                                                    val wavData = voiceManager.stopRecording()
+                                                    isVoiceRecording = false
+                                                    if (wavData == null) {
+                                                        return@launch
+                                                    }
+                                                    when (val validation = voiceManager.validateRecording(wavData)) {
+                                                        is VoicePreflightResult.Valid -> {
+                                                            viewModel.transcribeVoice(wavData) { transcript ->
+                                                                draft = appendVoiceTranscript(draft, transcript)
+                                                            }
+                                                        }
+                                                        VoicePreflightResult.TooShort -> {
+                                                            viewModel.setErrorMessage("Voice note was too short.")
+                                                        }
+                                                        is VoicePreflightResult.TooLong -> {
+                                                            viewModel.setErrorMessage("Voice note is too long. Keep it under 60 seconds.")
+                                                        }
+                                                        is VoicePreflightResult.TooLarge -> {
+                                                            viewModel.setErrorMessage("Voice note is too large to transcribe.")
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                keyboardController?.hide()
+                                                if (!voiceManager.hasPermission) {
+                                                    voicePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                                } else {
+                                                    isVoiceRecording = voiceManager.startRecording()
+                                                    if (!isVoiceRecording) {
+                                                        viewModel.setErrorMessage("Microphone unavailable right now.")
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    isVoiceRecording = isVoiceRecording,
+                                    isVoiceTranscribing = viewModel.voiceTranscribing,
                                     availableModels = uiState.availableModels,
                                     currentOverride = uiState.runtimeOverrideByThread[threadId],
                                     onOverrideChanged = { viewModel.setRuntimeOverride(threadId, it) },
-                                    gitStatus = uiState.gitStatus,
+                                    gitStatus = selectedGitStatus,
                                     onBranchClick = {
                                         if (cwd != null) {
                                             viewModel.gitBranches(cwd)
@@ -439,7 +605,21 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                                             showGitActions = true
                                         }
                                     },
-                                    accessModeLabel = uiState.selectedAccessMode.name,
+                                    selectedAccessMode = uiState.selectedAccessMode,
+                                    onAccessModeSelected = viewModel::setAccessMode,
+                                    onOpenCloud = {
+                                        context.startActivity(
+                                            Intent(
+                                                Intent.ACTION_VIEW,
+                                                Uri.parse("https://chatgpt.com/codex"),
+                                            ),
+                                        )
+                                    },
+                                    contextWindowUsage = contextWindowUsage,
+                                    rateLimitBuckets = uiState.rateLimitBuckets,
+                                    isLoadingRateLimits = uiState.isLoadingRateLimits,
+                                    rateLimitsErrorMessage = uiState.rateLimitsErrorMessage,
+                                    onShowUsageStatus = { showUsageStatusSheet = true },
                                 )
                             }
                         }
@@ -452,7 +632,7 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                         uiState.threads.find { it.id == tid }?.cwd
                     }
                     GitActionsSheet(
-                        gitStatus = uiState.gitStatus,
+                        gitStatus = selectedGitStatus,
                         onUpdate = { cwd?.let { viewModel.gitStatus(it) } },
                         onCommit = { cwd?.let { viewModel.gitCommit(it) } },
                         onPush = { cwd?.let { viewModel.gitPush(it) } },
@@ -506,8 +686,81 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                         onDismiss = { showBranchSelector = false },
                     )
                 }
+
+                if (showUsageStatusSheet) {
+                    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+                    LaunchedEffect(uiState.selectedThreadId, showUsageStatusSheet) {
+                        val selectedThreadId = uiState.selectedThreadId
+                        val selectedUsage = if (selectedThreadId != null) {
+                            uiState.contextWindowUsageByThread[selectedThreadId]
+                        } else {
+                            null
+                        }
+                        if (showUsageStatusSheet &&
+                            selectedThreadId != null &&
+                            uiState.isConnected &&
+                            (selectedUsage == null || !uiState.hasResolvedRateLimitsSnapshot)
+                        ) {
+                            viewModel.refreshUsageStatus(selectedThreadId)
+                        }
+                    }
+
+                    ModalBottomSheet(
+                        onDismissRequest = { showUsageStatusSheet = false },
+                        sheetState = sheetState,
+                        containerColor = MaterialTheme.colorScheme.surface,
+                    ) {
+                        UsageStatusSheetContent(
+                            usage = uiState.selectedThreadId?.let(uiState.contextWindowUsageByThread::get),
+                            rateLimitBuckets = uiState.rateLimitBuckets,
+                            isLoadingRateLimits = uiState.isLoadingRateLimits,
+                            rateLimitsErrorMessage = uiState.rateLimitsErrorMessage,
+                            onRefreshStatus = {
+                                viewModel.refreshUsageStatus(uiState.selectedThreadId)
+                            },
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+                        )
+                    }
+                }
             }
         }
+    }
+}
+
+private suspend fun loadComposerAttachmentsFromUris(
+    context: Context,
+    uris: List<Uri>,
+): List<ImageAttachment> = withContext(Dispatchers.IO) {
+    uris.mapNotNull { uri ->
+        val sourceData = runCatching {
+            context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        }.getOrNull() ?: return@mapNotNull null
+        ImageAttachmentPipeline.makeAttachment(sourceData)?.copy(sourceUri = uri.toString())
+    }
+}
+
+private suspend fun buildComposerAttachmentFromBitmap(bitmap: Bitmap): ImageAttachment? = withContext(Dispatchers.Default) {
+    ImageAttachmentPipeline.makeAttachment(bitmapToJpegBytes(bitmap) ?: return@withContext null)
+}
+
+private fun bitmapToJpegBytes(bitmap: Bitmap): ByteArray? {
+    val stream = java.io.ByteArrayOutputStream()
+    return if (bitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)) {
+        stream.toByteArray()
+    } else {
+        null
+    }
+}
+
+private fun appendVoiceTranscript(draft: String, transcript: String): String {
+    val trimmedTranscript = transcript.trim()
+    if (trimmedTranscript.isEmpty()) {
+        return draft
+    }
+    return if (draft.isBlank()) {
+        trimmedTranscript
+    } else {
+        draft.trimEnd() + "\n" + trimmedTranscript
     }
 }
 
@@ -745,7 +998,9 @@ private fun PairingScreen(
         Spacer(Modifier.height(40.dp))
 
         // Status label at bottom
-        if (uiState.errorMessage != null) {
+        if (uiState.errorMessage != null &&
+            uiState.connectionState != RelayConnectionState.CONNECTING &&
+            uiState.connectionState != RelayConnectionState.HANDSHAKING) {
             Text(
                 uiState.errorMessage,
                 style = MaterialTheme.typography.bodySmall,
@@ -773,6 +1028,7 @@ private fun QrScannerView(onDetected: (String) -> Unit) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
+    val latestOnDetected by rememberUpdatedState(onDetected)
     var permissionGranted by rememberSaveable {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED,
@@ -801,18 +1057,21 @@ private fun QrScannerView(onDetected: (String) -> Unit) {
 
     val scanner = remember { BarcodeScanning.getClient() }
     var handled by remember { mutableStateOf(false) }
+    val previewView = remember {
+        PreviewView(context).apply {
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        }
+    }
 
-    AndroidView(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(280.dp)
-            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(18.dp)),
-        factory = { ctx ->
-            PreviewView(ctx).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
-        },
-        update = { previewView ->
+    DisposableEffect(permissionGranted, lifecycleOwner, previewView) {
+        if (!permissionGranted) {
+            onDispose { }
+        } else {
             val executor = ContextCompat.getMainExecutor(context)
-            cameraProviderFuture.addListener({
+            var disposed = false
+            val bindCamera = Runnable {
+                if (disposed) return@Runnable
                 val cameraProvider = cameraProviderFuture.get()
                 val preview = Preview.Builder().build().also {
                     it.surfaceProvider = previewView.surfaceProvider
@@ -833,7 +1092,7 @@ private fun QrScannerView(onDetected: (String) -> Unit) {
                             val raw = barcodes.firstNotNullOfOrNull { it.rawValue }
                             if (!handled && raw != null) {
                                 handled = true
-                                onDetected(raw)
+                                latestOnDetected(raw)
                             }
                         }
                         .addOnCompleteListener { imageProxy.close() }
@@ -845,11 +1104,31 @@ private fun QrScannerView(onDetected: (String) -> Unit) {
                     preview,
                     analysis,
                 )
-            }, executor)
-        },
+            }
+            cameraProviderFuture.addListener(bindCamera, executor)
+            onDispose {
+                disposed = true
+                if (cameraProviderFuture.isDone) {
+                    runCatching { cameraProviderFuture.get().unbindAll() }
+                }
+            }
+        }
+    }
+
+    AndroidView(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(280.dp)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(18.dp)),
+        factory = { previewView },
     )
 
     DisposableEffect(Unit) {
-        onDispose { runCatching { scanner.close() } }
+        onDispose {
+            if (cameraProviderFuture.isDone) {
+                runCatching { cameraProviderFuture.get().unbindAll() }
+            }
+            runCatching { scanner.close() }
+        }
     }
 }

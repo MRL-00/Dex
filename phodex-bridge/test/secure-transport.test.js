@@ -249,6 +249,96 @@ test("secure transport round-trips encrypted payloads after a trusted reconnect 
   ]);
 });
 
+test("secure transport ignores replayed envelopes without surfacing a secure error", () => {
+  const macIdentity = createOkpKeyPair("ed25519");
+  const phoneIdentity = createOkpKeyPair("ed25519");
+  const phoneEphemeral = createOkpKeyPair("x25519");
+  const secureTransport = createBridgeSecureTransport({
+    sessionId: "session-replay",
+    relayUrl: "wss://relay.example/relay",
+    deviceState: {
+      macDeviceId: "mac-replay",
+      macIdentityPrivateKey: macIdentity.privateKey,
+      macIdentityPublicKey: macIdentity.publicKey,
+      trustedPhones: {
+        "phone-replay": phoneIdentity.publicKey,
+      },
+    },
+  });
+
+  const controlMessages = [];
+  const applicationMessages = [];
+  const { serverHello, transcriptBytes } = finishHandshake({
+    secureTransport,
+    sessionId: "session-replay",
+    macDeviceId: "mac-replay",
+    phoneDeviceId: "phone-replay",
+    macIdentity,
+    phoneIdentity,
+    phoneEphemeral,
+    handshakeMode: HANDSHAKE_MODE_TRUSTED_RECONNECT,
+    lastAppliedBridgeOutboundSeq: 0,
+    controlMessages,
+    applicationMessages,
+  });
+
+  const sharedSecret = diffieHellman({
+    privateKey: createPrivateKey({
+      key: {
+        crv: "X25519",
+        d: base64ToBase64Url(phoneEphemeral.privateKey),
+        kty: "OKP",
+        x: base64ToBase64Url(phoneEphemeral.publicKey),
+      },
+      format: "jwk",
+    }),
+    publicKey: createPublicKey({
+      key: {
+        crv: "X25519",
+        kty: "OKP",
+        x: base64ToBase64Url(serverHello.macEphemeralPublicKey),
+      },
+      format: "jwk",
+    }),
+  });
+  const salt = createHash("sha256").update(transcriptBytes).digest();
+  const infoPrefix = `remodex-e2ee-v1|session-replay|mac-replay|phone-replay|${serverHello.keyEpoch}`;
+  const phoneToMacKey = Buffer.from(
+    hkdfSync("sha256", sharedSecret, salt, Buffer.from(`${infoPrefix}|phoneToMac`, "utf8"), 32)
+  );
+
+  const envelope = encryptEnvelope(
+    {
+      payloadText: JSON.stringify({ id: "request-replay", method: "thread/list", params: {} }),
+    },
+    phoneToMacKey,
+    "iphone",
+    0,
+    "session-replay",
+    serverHello.keyEpoch
+  );
+
+  const sendWire = {
+    sendControlMessage(message) {
+      controlMessages.push(message);
+    },
+    onApplicationMessage(message) {
+      applicationMessages.push(message);
+    },
+  };
+
+  secureTransport.handleIncomingWireMessage(JSON.stringify(envelope), sendWire);
+  secureTransport.handleIncomingWireMessage(JSON.stringify(envelope), sendWire);
+
+  assert.deepEqual(applicationMessages, [
+    JSON.stringify({ id: "request-replay", method: "thread/list", params: {} }),
+  ]);
+  assert.equal(
+    controlMessages.some((message) => message.kind === "secureError" && message.code === "invalid_envelope"),
+    false
+  );
+});
+
 test("qr bootstrap allows a fresh QR scan to replace the trusted iPhone", () => {
   const macIdentity = createOkpKeyPair("ed25519");
   const firstPhoneIdentity = createOkpKeyPair("ed25519");

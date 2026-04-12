@@ -1,5 +1,6 @@
 package com.remodex.android.ui.component
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -105,7 +106,7 @@ fun GitActionsSheet(
             )
             GitMenuItem(
                 icon = { Icon(Icons.Rounded.Description, null, Modifier.size(20.dp)) },
-                text = "Create PR",
+                text = "View Changes",
                 onClick = {
                     onDiff()
                     onDismiss()
@@ -184,23 +185,29 @@ fun DiffStatsBadge(
 ) {
     val totals = gitStatus?.diffTotals ?: return
     if (totals.additions == 0 && totals.deletions == 0) return
+    val diffGreen = androidx.compose.ui.graphics.Color(0xFF22C55E)
+    val diffRed = androidx.compose.ui.graphics.Color(0xFFF04444)
 
     Row(
         modifier = modifier
             .clickable(onClick = onClick)
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .background(
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f),
+                shape = RoundedCornerShape(999.dp),
+            )
+            .padding(horizontal = 10.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(4.dp),
     ) {
         Text(
             "+${totals.additions}",
             style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.secondary,
+            color = diffGreen,
         )
         Text(
             "-${totals.deletions}",
             style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.error,
+            color = diffRed,
         )
     }
 }

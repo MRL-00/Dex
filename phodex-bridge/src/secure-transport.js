@@ -420,12 +420,14 @@ function createBridgeSecureTransport({
       || keyEpoch !== activeSession.keyEpoch
       || sender !== SECURE_SENDER_IPHONE
       || !Number.isInteger(counter)
-      || counter <= activeSession.lastInboundCounter
     ) {
       sendControlMessage(createSecureError({
         code: "invalid_envelope",
         message: "The bridge rejected an invalid or replayed secure envelope.",
       }));
+      return true;
+    }
+    if (counter <= activeSession.lastInboundCounter) {
       return true;
     }
 

@@ -49,6 +49,9 @@ import androidx.compose.ui.unit.sp
 import com.remodex.android.core.model.RemodexUiState
 import com.remodex.android.core.model.ThreadSummary
 
+private val SidebarDiffGreen = androidx.compose.ui.graphics.Color(0xFF22C55E)
+private val SidebarDiffRed = androidx.compose.ui.graphics.Color(0xFFF04444)
+
 private data class ProjectGroup(
     val name: String,
     val threads: List<ThreadSummary>,
@@ -93,7 +96,8 @@ fun SidebarContent(
 ) {
     var searchQuery by remember { mutableStateOf("") }
     // Track collapsed state per group, default expanded
-    val collapsedGroups = remember { mutableStateMapOf<String, Boolean>() }
+    // Track expanded state per group; groups default to collapsed
+    val expandedGroups = remember { mutableStateMapOf<String, Boolean>() }
 
     val filteredThreads = if (searchQuery.isBlank()) {
         uiState.threads
@@ -117,22 +121,15 @@ fun SidebarContent(
     ) {
         // App header with icon
         Row(
-            modifier = Modifier.padding(horizontal = 16.dp),
+            modifier = Modifier.padding(horizontal = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(
+            RemodexBrandIcon(
                 modifier = Modifier
-                    .size(32.dp)
-                    .background(MaterialTheme.colorScheme.primary, CircleShape),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    ">_",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onPrimary,
-                )
-            }
-            Spacer(Modifier.width(10.dp))
+                    .size(60.dp),
+                contentDescription = "Remodex app icon",
+            )
+            Spacer(Modifier.width(12.dp))
             Text(
                 "Remodex",
                 style = MaterialTheme.typography.titleLarge,
@@ -236,15 +233,19 @@ fun SidebarContent(
             modifier = Modifier.weight(1f),
         ) {
             projectGroups.forEach { group ->
-                val isCollapsed = collapsedGroups[group.name] == true
+                val isCollapsed = expandedGroups[group.name] != true
 
                 // Project header (clickable to collapse/expand)
                 item(key = "header_${group.name}") {
+                    val groupDiffTotals = group.threads
+                        .asSequence()
+                        .mapNotNull { thread -> uiState.gitStatusByThread[thread.id]?.diffTotals }
+                        .firstOrNull { totals -> totals.additions > 0 || totals.deletions > 0 }
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable {
-                                collapsedGroups[group.name] = !isCollapsed
+                                expandedGroups[group.name] = isCollapsed
                             }
                             .padding(horizontal = 16.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -262,6 +263,20 @@ fun SidebarContent(
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.onSurface,
                         )
+                        if (groupDiffTotals != null) {
+                            Text(
+                                "+${groupDiffTotals.additions}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SidebarDiffGreen,
+                            )
+                            Spacer(Modifier.width(2.dp))
+                            Text(
+                                "-${groupDiffTotals.deletions}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SidebarDiffRed,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                        }
                         IconButton(
                             onClick = onNewChat,
                             modifier = Modifier.size(28.dp),
@@ -292,9 +307,6 @@ fun SidebarContent(
                         val selected = uiState.selectedThreadId == thread.id
                         val isRunning = thread.id in uiState.runningThreadIds
                         val timeAgo = formatTimeAgo(thread.updatedAtMillis)
-                        val diffTotals = if (thread.id == uiState.selectedThreadId) {
-                            uiState.gitStatus?.diffTotals
-                        } else null
 
                         // Guard against blank/null titles
                         val displayTitle = thread.title.ifBlank { "New Thread" }
@@ -334,20 +346,6 @@ fun SidebarContent(
                                     MaterialTheme.colorScheme.onSurfaceVariant
                                 },
                             )
-                            if (diffTotals != null && (diffTotals.additions > 0 || diffTotals.deletions > 0)) {
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    "+${diffTotals.additions}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.secondary,
-                                )
-                                Spacer(Modifier.width(2.dp))
-                                Text(
-                                    "-${diffTotals.deletions}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.error,
-                                )
-                            }
                             if (timeAgo.isNotBlank()) {
                                 Spacer(Modifier.width(8.dp))
                                 Text(

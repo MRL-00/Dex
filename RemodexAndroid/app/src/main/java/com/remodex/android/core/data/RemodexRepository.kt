@@ -46,6 +46,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 
 class RemodexRepository(
     private val storage: AndroidSecureStorage,
+    private val messageHistoryStore: AndroidMessageHistoryStore,
     private val okHttpClient: OkHttpClient = OkHttpClient(),
     var notificationService: RemodexNotificationService? = null,
 ) {
@@ -58,20 +59,39 @@ class RemodexRepository(
     private val socketClient = RelayWebSocketClient(okHttpClient)
     private val pendingRequests = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<RpcMessage>>()
     private val secureControlFlow = MutableSharedFlow<JsonObject>(extraBufferCapacity = 64)
+    private val threadHistoryRefreshJobs = ConcurrentHashMap<String, Job>()
 
     private var secureSession: SecureSession? = null
     private var phoneIdentity: PhoneIdentityState = storage.getOrCreatePhoneIdentity()
     private var syncJob: Job? = null
+    private var messageHistorySaveJob: Job? = null
     var isAppInForeground: AtomicBoolean = AtomicBoolean(true)
+
+    private val persistedMessagesByThread = messageHistoryStore.load()
 
     private val _uiState = MutableStateFlow(
         RemodexUiState(
             hasSavedPairing = storage.readRelaySession() != null,
             relaySession = storage.readRelaySession(),
             trustedMacs = storage.readTrustedRegistry().records,
+            messagesByThread = persistedMessagesByThread,
         ),
     )
     val uiState: StateFlow<RemodexUiState> = _uiState.asStateFlow()
+    private val gitCoordinator = RemodexGitCoordinator(
+        sendRequest = ::sendRequest,
+        uiState = _uiState,
+        scope = scope,
+    )
+    private val realtimeCoordinator = RemodexRealtimeCoordinator(
+        uiState = _uiState,
+        isAppInForeground = isAppInForeground,
+        notificationServiceProvider = { notificationService },
+        sendRpc = ::sendRpc,
+        refreshGitStatus = ::gitStatus,
+        handleRateLimitsUpdated = ::handleRateLimitsUpdated,
+        scheduleMessageHistorySave = ::scheduleMessageHistorySave,
+    )
 
     init {
         scope.launch {
@@ -98,11 +118,24 @@ class RemodexRepository(
     }
 
     suspend fun connectFromSavedSession(forceQrBootstrap: Boolean = false) {
+        val currentState = _uiState.value.connectionState
+        if (!forceQrBootstrap &&
+            (currentState == RelayConnectionState.CONNECTING || currentState == RelayConnectionState.HANDSHAKING)
+        ) {
+            Log.d("Remodex", "connectFromSavedSession ignored because a connection attempt is already in progress")
+            return
+        }
         val savedSession = storage.readRelaySession()
         if (savedSession == null) {
             _uiState.update { it.copy(errorMessage = "No saved pairing. Scan a QR code first.") }
             return
         }
+
+        stopSyncLoop()
+        secureSession = null
+        socketClient.disconnect()
+        pendingRequests.values.forEach { it.cancel() }
+        pendingRequests.clear()
 
         _uiState.update {
             it.copy(
@@ -113,7 +146,13 @@ class RemodexRepository(
             )
         }
         try {
-            val connectedSession = tryResolvedTrustedSession(savedSession) ?: savedSession
+            val connectedSession = tryResolvedTrustedSession(
+                savedSession = savedSession,
+                storage = storage,
+                phoneIdentity = phoneIdentity,
+                okHttpClient = okHttpClient,
+                json = json,
+            ) ?: savedSession
             connectInternal(connectedSession, forceQrBootstrap)
         } catch (error: TimeoutCancellationException) {
             logError("connect timed out", error)
@@ -140,6 +179,7 @@ class RemodexRepository(
 
     suspend fun disconnect(clearPairing: Boolean = false) {
         stopSyncLoop()
+        messageHistorySaveJob?.cancel()
         pendingRequests.values.forEach { it.cancel() }
         pendingRequests.clear()
         secureSession = null
@@ -169,6 +209,7 @@ class RemodexRepository(
                         listOf("cli", "vscode", "appServer", "exec", "unknown").map(::JsonPrimitive),
                     ),
                     "cursor" to JsonNull,
+                    "limit" to JsonPrimitive(60),
                 ),
             ),
         )
@@ -184,9 +225,11 @@ class RemodexRepository(
                 selectedThreadId = it.selectedThreadId ?: threads.firstOrNull()?.id,
             )
         }
-        _uiState.value.selectedThreadId?.let { selectedThreadId ->
-            openThread(selectedThreadId)
-        }
+        gitCoordinator.prefetchGitStatusForThreads(threads)
+    }
+
+    fun setErrorMessage(message: String?) {
+        _uiState.update { it.copy(errorMessage = message) }
     }
 
     suspend fun startThread() {
@@ -205,45 +248,62 @@ class RemodexRepository(
     }
 
     suspend fun openThread(threadId: String) {
-        _uiState.update { it.copy(selectedThreadId = threadId, errorMessage = null) }
-        val response = sendRequest(
-            method = "thread/read",
-            params = JsonObject(
-                mapOf(
-                    "threadId" to JsonPrimitive(threadId),
-                    "includeTurns" to JsonPrimitive(true),
-                ),
-            ),
-        )
-        val threadObject = response.result.jsonObjectOrNull()?.get("thread")?.jsonObjectOrNull() ?: return
-        val history = parseThreadHistory(threadId, threadObject)
         _uiState.update { state ->
-            state.copy(messagesByThread = state.messagesByThread + (threadId to history))
+            val hasCachedMessages = state.messagesByThread[threadId].orEmpty().isNotEmpty()
+            state.copy(
+                selectedThreadId = threadId,
+                errorMessage = null,
+                loadingThreadIds = if (hasCachedMessages) {
+                    state.loadingThreadIds - threadId
+                } else {
+                    state.loadingThreadIds + threadId
+                },
+            )
         }
+        requestThreadHistoryRefresh(threadId)
     }
 
-    suspend fun sendTurn(threadId: String, text: String) {
+    suspend fun sendTurn(threadId: String, text: String, attachments: List<ImageAttachment> = emptyList()) {
         val trimmed = text.trim()
-        if (trimmed.isEmpty()) {
+        val sanitizedAttachments = attachments.map { it.sanitizedForMessage() }
+        if (trimmed.isEmpty() && sanitizedAttachments.isEmpty()) {
             return
         }
+        val localMessageId = UUID.randomUUID().toString()
         val localMessage = ConversationMessage(
-            id = UUID.randomUUID().toString(),
+            id = localMessageId,
             threadId = threadId,
             role = MessageRole.USER,
             text = trimmed,
+            attachments = sanitizedAttachments,
         )
         appendMessage(threadId, localMessage)
-        val input = JsonArray(
-            listOf(
-                JsonObject(
-                    mapOf(
-                        "type" to JsonPrimitive("text"),
-                        "text" to JsonPrimitive(trimmed),
+        val inputItems = buildList {
+            attachments.forEach { attachment ->
+                val payloadDataUrl = attachment.payloadDataUrl?.trim().orEmpty()
+                if (payloadDataUrl.isNotEmpty()) {
+                    add(
+                        JsonObject(
+                            mapOf(
+                                "type" to JsonPrimitive("image"),
+                                "image_url" to JsonPrimitive(payloadDataUrl),
+                            ),
+                        ),
+                    )
+                }
+            }
+            if (trimmed.isNotEmpty()) {
+                add(
+                    JsonObject(
+                        mapOf(
+                            "type" to JsonPrimitive("text"),
+                            "text" to JsonPrimitive(trimmed),
+                        ),
                     ),
-                ),
-            ),
-        )
+                )
+            }
+        }
+        val input = JsonArray(inputItems)
         val turnParams = mutableMapOf<String, JsonElement>(
             "threadId" to JsonPrimitive(threadId),
             "input" to input,
@@ -257,6 +317,7 @@ class RemodexRepository(
         val response = sendRequest(method = "turn/start", params = JsonObject(turnParams))
         val turnId = extractTurnId(response.result.jsonObjectOrNull())
         if (turnId != null) {
+            updateMessageTurnId(threadId, localMessageId, turnId)
             _uiState.update {
                 it.copy(
                     activeTurnIdByThread = it.activeTurnIdByThread + (threadId to turnId),
@@ -294,6 +355,71 @@ class RemodexRepository(
         _uiState.update { it.copy(pendingApproval = null) }
     }
 
+    private suspend fun refreshThreadHistory(threadId: String) {
+        val response = sendRequest(
+            method = "thread/read",
+            params = JsonObject(
+                mapOf(
+                    "threadId" to JsonPrimitive(threadId),
+                    "includeTurns" to JsonPrimitive(true),
+                ),
+            ),
+        )
+        val threadObject = response.result.jsonObjectOrNull()?.get("thread")?.jsonObjectOrNull()
+        if (threadObject == null) {
+            _uiState.update { state -> state.copy(loadingThreadIds = state.loadingThreadIds - threadId) }
+            return
+        }
+        val contextWindowUsage = extractContextWindowUsage(threadObject)
+            ?: extractContextWindowUsage(threadObject["usage"]?.jsonObjectOrNull())
+        val history = withContext(Dispatchers.Default) {
+            RemodexConversationHistoryParser.parseThreadHistory(threadId, threadObject)
+        }
+        var shouldPersist = false
+        _uiState.update { state ->
+            val mergedHistory = RemodexConversationHistoryParser.mergeThreadHistory(
+                existing = state.messagesByThread[threadId].orEmpty(),
+                history = history,
+            )
+            shouldPersist = mergedHistory != state.messagesByThread[threadId]
+            state.copy(
+                messagesByThread = state.messagesByThread + (threadId to mergedHistory),
+                loadingThreadIds = state.loadingThreadIds - threadId,
+                contextWindowUsageByThread = if (contextWindowUsage != null) {
+                    state.contextWindowUsageByThread + mapOf(threadId to contextWindowUsage)
+                } else {
+                    state.contextWindowUsageByThread
+                },
+            )
+        }
+        if (shouldPersist) {
+            scheduleMessageHistorySave()
+        }
+    }
+
+    private fun requestThreadHistoryRefresh(threadId: String) {
+        threadHistoryRefreshJobs[threadId]?.cancel()
+        threadHistoryRefreshJobs[threadId] = scope.launch {
+            try {
+                refreshThreadHistory(threadId)
+            } catch (error: Exception) {
+                logError("refreshThreadHistory failed", error)
+                _uiState.update { state ->
+                    state.copy(
+                        errorMessage = if (state.selectedThreadId == threadId) {
+                            userFacingConnectionError(error)
+                        } else {
+                            state.errorMessage
+                        },
+                        loadingThreadIds = state.loadingThreadIds - threadId,
+                    )
+                }
+            } finally {
+                threadHistoryRefreshJobs.remove(threadId)
+            }
+        }
+    }
+
     // ── Sync loop ──────────────────────────────────────────────────────
 
     private fun startSyncLoop() {
@@ -308,6 +434,8 @@ class RemodexRepository(
     private fun stopSyncLoop() {
         syncJob?.cancel()
         syncJob = null
+        threadHistoryRefreshJobs.values.forEach { it.cancel() }
+        threadHistoryRefreshJobs.clear()
     }
 
     private suspend fun threadListSyncLoop() {
@@ -332,7 +460,7 @@ class RemodexRepository(
             }
             delay(interval)
             if (_uiState.value.isConnected && threadId != null) {
-                runCatching { openThread(threadId) }
+                runCatching { refreshThreadHistory(threadId) }
             }
         }
     }
@@ -344,7 +472,7 @@ class RemodexRepository(
             if (_uiState.value.isConnected && _uiState.value.runningThreadIds.isNotEmpty()) {
                 for (threadId in _uiState.value.runningThreadIds) {
                     if (threadId != _uiState.value.selectedThreadId) {
-                        runCatching { openThread(threadId) }
+                        runCatching { refreshThreadHistory(threadId) }
                     }
                 }
             }
@@ -354,72 +482,40 @@ class RemodexRepository(
     // ── Git actions ──────────────────────────────────────────────────
 
     suspend fun gitStatus(cwd: String): GitRepoSyncResult? {
-        val response = sendRequest("git/status", JsonObject(mapOf("cwd" to JsonPrimitive(cwd))))
-        val obj = response.result.jsonObjectOrNull() ?: return null
-        val result = parseGitRepoSyncResult(obj)
-        _uiState.update { it.copy(gitStatus = result) }
-        return result
+        return gitCoordinator.gitStatus(cwd)
     }
 
     suspend fun gitCommit(cwd: String, message: String? = null): GitCommitResult? {
-        val params = mutableMapOf<String, JsonElement>("cwd" to JsonPrimitive(cwd))
-        message?.let { params["message"] = JsonPrimitive(it) }
-        val response = sendRequest("git/commit", JsonObject(params))
-        val obj = response.result.jsonObjectOrNull() ?: return null
-        return GitCommitResult(
-            hash = obj.stringOrNull("hash"),
-            branch = obj.stringOrNull("branch"),
-            summary = obj.stringOrNull("summary"),
-        )
+        return gitCoordinator.gitCommit(cwd, message)
     }
 
     suspend fun gitPush(cwd: String): GitPushResult? {
-        val response = sendRequest("git/push", JsonObject(mapOf("cwd" to JsonPrimitive(cwd))))
-        val obj = response.result.jsonObjectOrNull() ?: return null
-        return GitPushResult(
-            branch = obj.stringOrNull("branch"),
-            remote = obj.stringOrNull("remote"),
-            updated = obj.boolOrNull("updated") ?: false,
-            status = obj.stringOrNull("status"),
-        )
+        return gitCoordinator.gitPush(cwd)
     }
 
     suspend fun gitPull(cwd: String): GitPullResult? {
-        val response = sendRequest("git/pull", JsonObject(mapOf("cwd" to JsonPrimitive(cwd))))
-        val obj = response.result.jsonObjectOrNull() ?: return null
-        return GitPullResult(status = obj.stringOrNull("status"))
+        return gitCoordinator.gitPull(cwd)
     }
 
     suspend fun gitBranches(cwd: String): GitBranchesResult? {
-        val response = sendRequest("git/branches", JsonObject(mapOf("cwd" to JsonPrimitive(cwd))))
-        val obj = response.result.jsonObjectOrNull() ?: return null
-        val result = parseGitBranchesResult(obj)
-        _uiState.update { it.copy(gitBranches = result) }
-        return result
+        return gitCoordinator.gitBranches(cwd)
     }
 
     suspend fun gitDiff(cwd: String): GitDiffResult? {
-        val response = sendRequest("git/diff", JsonObject(mapOf("cwd" to JsonPrimitive(cwd))))
-        val obj = response.result.jsonObjectOrNull() ?: return null
-        return GitDiffResult(patch = obj.stringOrNull("patch"))
+        return gitCoordinator.gitDiff(cwd)
     }
 
     suspend fun gitCheckout(cwd: String, branch: String): GitCheckoutResult? {
-        val response = sendRequest(
-            "git/checkout",
-            JsonObject(mapOf("cwd" to JsonPrimitive(cwd), "branch" to JsonPrimitive(branch))),
-        )
-        val obj = response.result.jsonObjectOrNull() ?: return null
-        return GitCheckoutResult(status = obj.stringOrNull("status"))
+        return gitCoordinator.gitCheckout(cwd, branch)
     }
 
     suspend fun gitCreateBranch(cwd: String, name: String): GitCreateBranchResult? {
-        val response = sendRequest(
-            "git/createBranch",
-            JsonObject(mapOf("cwd" to JsonPrimitive(cwd), "name" to JsonPrimitive(name))),
-        )
-        val obj = response.result.jsonObjectOrNull() ?: return null
-        return GitCreateBranchResult(status = obj.stringOrNull("status"), branch = obj.stringOrNull("branch"))
+        return gitCoordinator.gitCreateBranch(cwd, name)
+    }
+
+    suspend fun refreshUsageStatus(threadId: String?) {
+        threadId?.trim()?.takeIf(String::isNotEmpty)?.let { refreshContextWindowUsage(it) }
+        refreshRateLimits()
     }
 
     // ── Model / runtime config ──────────────────────────────────────
@@ -447,6 +543,90 @@ class RemodexRepository(
     fun setRuntimeOverride(threadId: String, override: ThreadRuntimeOverride) {
         _uiState.update {
             it.copy(runtimeOverrideByThread = it.runtimeOverrideByThread + (threadId to override))
+        }
+    }
+
+    // ── Usage status ────────────────────────────────────────────────
+
+    suspend fun refreshContextWindowUsage(threadId: String) {
+        val trimmedThreadId = threadId.trim()
+        if (trimmedThreadId.isEmpty()) {
+            return
+        }
+
+        val params = buildMap<String, JsonElement> {
+            put("threadId", JsonPrimitive(trimmedThreadId))
+            _uiState.value.activeTurnIdByThread[trimmedThreadId]
+                ?.trim()
+                ?.takeIf(String::isNotEmpty)
+                ?.let { put("turnId", JsonPrimitive(it)) }
+        }
+
+        runCatching {
+            val response = sendRequest("thread/contextWindow/read", JsonObject(params))
+            val resultObject = response.result.jsonObjectOrNull() ?: return
+            val usage = extractContextWindowUsage(resultObject["usage"]?.jsonObjectOrNull())
+                ?: extractContextWindowUsage(resultObject)
+            if (usage != null) {
+                _uiState.update {
+                    it.copy(contextWindowUsageByThread = it.contextWindowUsageByThread + mapOf(trimmedThreadId to usage))
+                }
+            }
+        }
+    }
+
+    suspend fun refreshRateLimits() {
+        _uiState.update {
+            it.copy(
+                isLoadingRateLimits = true,
+                rateLimitsErrorMessage = null,
+            )
+        }
+
+        try {
+            val response = fetchRateLimitsWithCompatRetry()
+            val resultObject = response.result.jsonObjectOrNull()
+                ?: throw IllegalStateException("account/rateLimits/read response missing payload")
+            applyRateLimitsPayload(resultObject, mergeWithExisting = false)
+            _uiState.update {
+                it.copy(
+                    hasResolvedRateLimitsSnapshot = true,
+                    rateLimitsErrorMessage = null,
+                )
+            }
+        } catch (error: Exception) {
+            val recoveredPayload = recoverRateLimitsPayloadFromError(error.message)
+            if (recoveredPayload != null) {
+                applyRateLimitsPayload(recoveredPayload, mergeWithExisting = false)
+                _uiState.update {
+                    it.copy(
+                        hasResolvedRateLimitsSnapshot = true,
+                        rateLimitsErrorMessage = null,
+                    )
+                }
+            } else {
+                val message = sanitizedRateLimitsErrorMessage(error.message)
+                _uiState.update {
+                    it.copy(
+                        rateLimitBuckets = emptyList(),
+                        hasResolvedRateLimitsSnapshot = false,
+                        rateLimitsErrorMessage = message,
+                    )
+                }
+            }
+        } finally {
+            _uiState.update { it.copy(isLoadingRateLimits = false) }
+        }
+    }
+
+    fun handleRateLimitsUpdated(params: JsonObject?) {
+        params ?: return
+        applyRateLimitsPayload(params, mergeWithExisting = true)
+        _uiState.update {
+            it.copy(
+                hasResolvedRateLimitsSnapshot = true,
+                rateLimitsErrorMessage = null,
+            )
         }
     }
 
@@ -496,8 +676,91 @@ class RemodexRepository(
     suspend fun attemptAutoReconnect() {
         if (_uiState.value.isConnected) return
         if (!_uiState.value.hasSavedPairing) return
+        if (_uiState.value.connectionState == RelayConnectionState.CONNECTING ||
+            _uiState.value.connectionState == RelayConnectionState.HANDSHAKING) {
+            return
+        }
         Log.d("Remodex", "Attempting auto-reconnect on foreground resume")
         runCatching { connectFromSavedSession() }
+    }
+
+    private suspend fun fetchRateLimitsWithCompatRetry(): RpcMessage {
+        return try {
+            sendRequest("account/rateLimits/read", null)
+        } catch (error: Exception) {
+            if (!shouldRetryRateLimitsWithEmptyParams(error)) {
+                throw error
+            }
+            sendRequest("account/rateLimits/read", JsonObject(emptyMap()))
+        }
+    }
+
+    private fun applyRateLimitsPayload(
+        payloadObject: JsonObject,
+        mergeWithExisting: Boolean,
+    ) {
+        val decodedBuckets = decodeRateLimitBuckets(payloadObject)
+        val resolvedBuckets = if (mergeWithExisting) {
+            mergeRateLimitBuckets(_uiState.value.rateLimitBuckets, decodedBuckets)
+        } else {
+            decodedBuckets
+        }
+        val sortedBuckets = resolvedBuckets.sortedWith(
+            compareBy<RateLimitBucket> { it.sortDurationMins }
+                .thenBy { it.displayLabel.lowercase() },
+        )
+        _uiState.update { it.copy(rateLimitBuckets = sortedBuckets) }
+    }
+
+    private fun shouldRetryRateLimitsWithEmptyParams(error: Exception): Boolean {
+        val lowered = error.message?.lowercase().orEmpty()
+        return lowered.contains("invalid params") ||
+            lowered.contains("invalid param") ||
+            lowered.contains("failed to parse") ||
+            lowered.contains("expected") ||
+            lowered.contains("missing field `params`") ||
+            lowered.contains("missing field params")
+    }
+
+    private fun recoverRateLimitsPayloadFromError(message: String?): JsonObject? {
+        val rawMessage = message?.trim().orEmpty()
+        if (rawMessage.isEmpty()) {
+            return null
+        }
+
+        val bodyMarker = rawMessage.indexOf("body=")
+        if (bodyMarker < 0) {
+            return null
+        }
+
+        val jsonText = rawMessage.substring(bodyMarker + "body=".length).trim()
+        if (!jsonText.startsWith("{")) {
+            return null
+        }
+
+        return runCatching {
+            json.parseToJsonElement(jsonText).jsonObjectOrNull()
+        }.getOrNull()
+    }
+
+    private fun sanitizedRateLimitsErrorMessage(message: String?): String {
+        val rawMessage = message?.trim().orEmpty()
+        if (rawMessage.isEmpty()) {
+            return "Unable to load rate limits."
+        }
+
+        val lowered = rawMessage.lowercase()
+        return when {
+            lowered.contains("failed to fetch codex rate limits") ||
+                lowered.contains("decode error") ||
+                lowered.contains("unknown variant") -> {
+                    "Rate limits are temporarily unavailable for this account."
+                }
+
+            else -> rawMessage.lineSequence().firstOrNull()?.take(180)?.ifBlank {
+                "Unable to load rate limits."
+            } ?: "Unable to load rate limits."
+        }
     }
 
     private suspend fun connectInternal(savedSession: SavedRelaySession, forceQrBootstrap: Boolean) {
@@ -706,6 +969,10 @@ class RemodexRepository(
             "serverHello", "secureReady" -> secureControlFlow.emit(root)
             "secureError" -> {
                 val error = json.decodeFromJsonElement(SecureErrorMessage.serializer(), root)
+                if (error.code == "invalid_envelope") {
+                    Log.d("Remodex", "Ignoring recoverable bridge secureError: ${error.code}")
+                    return
+                }
                 _uiState.update {
                     it.copy(
                         connectionState = if (error.code == "update_required") {
@@ -729,13 +996,20 @@ class RemodexRepository(
         if (envelope.sessionId != session.sessionId || envelope.keyEpoch != session.keyEpoch) {
             return
         }
-        if (envelope.sender != "mac" || envelope.counter <= session.lastInboundCounter) {
+        if (envelope.sender != "mac") {
             _uiState.update {
                 it.copy(
                     connectionState = RelayConnectionState.RECONNECT_REQUIRED,
                     errorMessage = "The secure Remodex payload could not be verified.",
                 )
             }
+            return
+        }
+        if (envelope.counter <= session.lastInboundCounter) {
+            Log.d(
+                "Remodex",
+                "Ignoring stale secure envelope counter=${envelope.counter} last=${session.lastInboundCounter}",
+            )
             return
         }
         val payload = SecureTransportCrypto.decryptEnvelope(session, envelope) ?: return
@@ -753,9 +1027,9 @@ class RemodexRepository(
     private suspend fun handleRpcMessage(message: RpcMessage) {
         if (message.method != null) {
             if (message.id != null) {
-                handleServerRequest(message)
+                realtimeCoordinator.handleServerRequest(message)
             } else {
-                handleNotification(message.method, message.params.jsonObjectOrNull())
+                realtimeCoordinator.handleNotification(message.method, message.params.jsonObjectOrNull())
             }
             return
         }
@@ -763,331 +1037,27 @@ class RemodexRepository(
         pendingRequests.remove(requestKey)?.complete(message)
     }
 
-    private suspend fun handleServerRequest(message: RpcMessage) {
-        val method = message.method ?: return
-        val params = message.params.jsonObjectOrNull()
-
-        // Approval requests
-        if (method.endsWith("requestApproval")) {
-            // Auto-approve in full-access mode
-            if (_uiState.value.selectedAccessMode == AccessMode.FULL_ACCESS) {
-                sendRpc(
-                    RpcMessage(
-                        id = message.id,
-                        result = JsonObject(mapOf("decision" to JsonPrimitive("accept"))),
-                    ),
-                )
-                return
-            }
-            _uiState.update {
-                it.copy(
-                    pendingApproval = PendingApproval(
-                        requestKey = idKey(message.id),
-                        requestId = message.id ?: JsonNull,
-                        method = method,
-                        command = params?.stringOrNull("command"),
-                        reason = params?.stringOrNull("reason"),
-                        threadId = extractThreadId(params),
-                        turnId = extractTurnId(params),
-                    ),
-                )
-            }
-            return
-        }
-
-        // Structured user input requests (plan mode questions)
-        if (method == "item/tool/requestUserInput" || method == "tool/requestUserInput") {
-            if (params != null) {
-                val questions = parseStructuredInputQuestions(params)
-                if (questions.isNotEmpty()) {
-                    val request = StructuredUserInputRequest(
-                        requestId = message.id ?: JsonNull,
-                        threadId = extractThreadId(params) ?: _uiState.value.selectedThreadId ?: "",
-                        turnId = extractTurnId(params),
-                        itemId = extractItemId(params),
-                        questions = questions,
-                    )
-                    _uiState.update {
-                        it.copy(structuredInputRequests = it.structuredInputRequests + request)
-                    }
-                    // Notify if backgrounded
-                    if (!isAppInForeground.get()) {
-                        val threadTitle = _uiState.value.threads
-                            .find { it.id == request.threadId }?.title ?: "Remodex"
-                        notificationService?.notifyStructuredInput(
-                            request.threadId, threadTitle, questions.size,
-                        )
-                    }
-                }
-            }
-            return
-        }
-
-        sendRpc(
-            RpcMessage(
-                id = message.id,
-                error = RpcError(
-                    code = -32601,
-                    message = "Unsupported request method: $method",
-                ),
-            ),
-        )
-    }
-
-    private suspend fun handleNotification(method: String, params: JsonObject?) {
-        when (method) {
-            "thread/started" -> {
-                val thread = params?.get("thread")?.jsonObjectOrNull()?.let(::threadSummaryFromJson)
-                    ?: params?.let(::threadSummaryFromJson)
-                if (thread != null) {
-                    _uiState.update {
-                        it.copy(threads = listOf(thread) + it.threads.filterNot { existing -> existing.id == thread.id })
-                    }
-                }
-            }
-
-            "thread/listChanged" -> {
-                val threadsArray = params?.get("threads")?.jsonArrayOrNull()
-                if (threadsArray != null) {
-                    val threads = threadsArray.mapNotNull { it.jsonObjectOrNull()?.let(::threadSummaryFromJson) }
-                    _uiState.update { it.copy(threads = threads) }
-                }
-            }
-
-            "turn/started" -> {
-                val threadId = extractThreadId(params) ?: return
-                val turnId = extractTurnId(params) ?: return
-                _uiState.update {
-                    it.copy(
-                        activeTurnIdByThread = it.activeTurnIdByThread + (threadId to turnId),
-                        runningThreadIds = it.runningThreadIds + threadId,
-                    )
-                }
-            }
-
-            "turn/completed", "turn/failed" -> {
-                val threadId = extractThreadId(params) ?: return
-                val isSuccess = method == "turn/completed"
-                _uiState.update {
-                    it.copy(
-                        activeTurnIdByThread = it.activeTurnIdByThread - threadId,
-                        runningThreadIds = it.runningThreadIds - threadId,
-                        planStateByThread = it.planStateByThread - threadId,
-                    )
-                }
-                // Post local notification if backgrounded
-                if (!isAppInForeground.get()) {
-                    val threadTitle = _uiState.value.threads.find { it.id == threadId }?.title ?: "Remodex"
-                    notificationService?.notifyRunCompletion(threadId, threadTitle, isSuccess)
-                }
-            }
-
-            // Plan mode
-            "turn/plan/updated", "turn/planUpdated" -> {
-                val turnId = extractTurnId(params) ?: return
-                val threadId = extractThreadId(params) ?: _uiState.value.selectedThreadId ?: return
-                val explanation = params?.stringOrNull("explanation")
-                val steps = params?.let { parsePlanSteps(it) } ?: emptyList()
-                _uiState.update {
-                    it.copy(
-                        planStateByThread = it.planStateByThread + (threadId to PlanState(
-                            turnId = turnId,
-                            threadId = threadId,
-                            explanation = explanation,
-                            steps = steps,
-                        )),
-                    )
-                }
-            }
-
-            "turn/plan/delta", "turn/planDelta", "item/plan/delta" -> {
-                val threadId = extractThreadId(params) ?: _uiState.value.selectedThreadId ?: return
-                val delta = extractDelta(params) ?: return
-                _uiState.update { state ->
-                    val existing = state.planStateByThread[threadId]
-                    if (existing != null) {
-                        state.copy(
-                            planStateByThread = state.planStateByThread + (threadId to existing.copy(
-                                streamingText = (existing.streamingText ?: "") + delta,
-                            )),
-                        )
-                    } else {
-                        state
-                    }
-                }
-            }
-
-            // Thinking / reasoning deltas
-            "item/reasoning/delta", "codex/event/reasoning_delta" -> {
-                val threadId = extractThreadId(params) ?: _uiState.value.selectedThreadId ?: return
-                val turnId = extractTurnId(params)
-                val itemId = extractItemId(params)
-                val delta = extractDelta(params) ?: return
-                appendThinkingDelta(threadId, turnId, itemId, delta)
-            }
-
-            // Tool activity
-            "item/toolUse/started", "item/tool/started", "codex/event/tool_use_begin" -> {
-                val threadId = extractThreadId(params) ?: _uiState.value.selectedThreadId ?: return
-                val turnId = extractTurnId(params)
-                val itemId = extractItemId(params)
-                val toolName = params?.stringOrNull("name", "tool", "toolName") ?: "tool"
-                appendMessage(threadId, ConversationMessage(
-                    id = itemId ?: UUID.randomUUID().toString(),
-                    threadId = threadId,
-                    role = MessageRole.ASSISTANT,
-                    kind = MessageKind.TOOL_ACTIVITY,
-                    text = toolName,
-                    turnId = turnId,
-                    itemId = itemId,
-                    isStreaming = true,
-                ))
-            }
-
-            "item/toolUse/completed", "item/tool/completed", "codex/event/tool_use_end" -> {
-                val threadId = extractThreadId(params) ?: _uiState.value.selectedThreadId ?: return
-                val itemId = extractItemId(params)
-                if (itemId != null) {
-                    _uiState.update { state ->
-                        val messages = state.messagesByThread[threadId].orEmpty().toMutableList()
-                        val idx = messages.indexOfLast { it.itemId == itemId && it.kind == MessageKind.TOOL_ACTIVITY }
-                        if (idx >= 0) {
-                            messages[idx] = messages[idx].copy(isStreaming = false)
-                            state.copy(messagesByThread = state.messagesByThread + (threadId to messages))
-                        } else {
-                            state
-                        }
-                    }
-                }
-            }
-
-            // Content deltas (assistant messages)
-            "item/agentMessage/delta", "codex/event/agent_message_content_delta", "codex/event/agent_message_delta" -> {
-                val threadId = extractThreadId(params) ?: _uiState.value.selectedThreadId ?: return
-                val turnId = extractTurnId(params)
-                val itemId = extractItemId(params)
-                val delta = extractDelta(params) ?: return
-                appendAssistantDelta(threadId, turnId, itemId, delta)
-            }
-
-            "item/completed", "codex/event/item_completed", "codex/event/agent_message" -> {
-                val threadId = extractThreadId(params) ?: _uiState.value.selectedThreadId ?: return
-                val turnId = extractTurnId(params)
-                val itemId = extractItemId(params)
-                val text = extractCompletedText(params)
-                if (!text.isNullOrBlank()) {
-                    completeAssistantMessage(threadId, turnId, itemId, text)
-                }
-            }
-
-            // Git repo changed
-            "repo/changed", "repo/refreshSignal" -> {
-                val threadId = extractThreadId(params) ?: _uiState.value.selectedThreadId
-                val cwd = threadId?.let { tid -> _uiState.value.threads.find { it.id == tid }?.cwd }
-                if (cwd != null) {
-                    runCatching { gitStatus(cwd) }
-                }
-            }
-
-            // Rate limit updates
-            "account/rateLimitsUpdated" -> {
-                Log.d("Remodex", "Rate limits updated (handling deferred)")
-            }
-
-            // Bridge update available
-            "ui/bridgeUpdateAvailable" -> {
-                val message = params?.stringOrNull("message") ?: "A bridge update is available."
-                _uiState.update { it.copy(errorMessage = message) }
-            }
-
-            "error", "turn/error", "codex/event/error" -> {
-                _uiState.update { it.copy(errorMessage = extractCompletedText(params) ?: "Runtime error.") }
-            }
-        }
-    }
-
-    private fun appendAssistantDelta(threadId: String, turnId: String?, itemId: String?, delta: String) {
-        _uiState.update { state ->
-            val messages = state.messagesByThread[threadId].orEmpty().toMutableList()
-            val existingIndex = messages.indexOfLast {
-                it.role == MessageRole.ASSISTANT &&
-                    ((itemId != null && it.itemId == itemId) || (turnId != null && it.turnId == turnId)) &&
-                    it.isStreaming
-            }
-            if (existingIndex >= 0) {
-                val current = messages[existingIndex]
-                messages[existingIndex] = current.copy(text = current.text + delta, isStreaming = true)
-            } else {
-                messages += ConversationMessage(
-                    id = itemId ?: UUID.randomUUID().toString(),
-                    threadId = threadId,
-                    role = MessageRole.ASSISTANT,
-                    text = delta,
-                    turnId = turnId,
-                    itemId = itemId,
-                    isStreaming = true,
-                )
-            }
-            state.copy(messagesByThread = state.messagesByThread + (threadId to messages))
-        }
-    }
-
-    private fun completeAssistantMessage(threadId: String, turnId: String?, itemId: String?, text: String) {
-        _uiState.update { state ->
-            val messages = state.messagesByThread[threadId].orEmpty().toMutableList()
-            val existingIndex = messages.indexOfLast {
-                it.role == MessageRole.ASSISTANT &&
-                    ((itemId != null && it.itemId == itemId) || (turnId != null && it.turnId == turnId))
-            }
-            if (existingIndex >= 0) {
-                messages[existingIndex] = messages[existingIndex].copy(text = text, isStreaming = false)
-            } else {
-                messages += ConversationMessage(
-                    id = itemId ?: UUID.randomUUID().toString(),
-                    threadId = threadId,
-                    role = MessageRole.ASSISTANT,
-                    text = text,
-                    turnId = turnId,
-                    itemId = itemId,
-                    isStreaming = false,
-                )
-            }
-            state.copy(messagesByThread = state.messagesByThread + (threadId to messages))
-        }
-    }
-
-    private fun appendThinkingDelta(threadId: String, turnId: String?, itemId: String?, delta: String) {
-        _uiState.update { state ->
-            val messages = state.messagesByThread[threadId].orEmpty().toMutableList()
-            val existingIndex = messages.indexOfLast {
-                it.kind == MessageKind.THINKING &&
-                    ((itemId != null && it.itemId == itemId) || (turnId != null && it.turnId == turnId)) &&
-                    it.isStreaming
-            }
-            if (existingIndex >= 0) {
-                val current = messages[existingIndex]
-                messages[existingIndex] = current.copy(text = current.text + delta, isStreaming = true)
-            } else {
-                messages += ConversationMessage(
-                    id = itemId ?: "thinking-${UUID.randomUUID()}",
-                    threadId = threadId,
-                    role = MessageRole.ASSISTANT,
-                    kind = MessageKind.THINKING,
-                    text = delta,
-                    turnId = turnId,
-                    itemId = itemId,
-                    isStreaming = true,
-                )
-            }
-            state.copy(messagesByThread = state.messagesByThread + (threadId to messages))
-        }
-    }
-
     private fun appendMessage(threadId: String, message: ConversationMessage) {
         _uiState.update { state ->
             val messages = state.messagesByThread[threadId].orEmpty() + message
             state.copy(messagesByThread = state.messagesByThread + (threadId to messages))
         }
+        scheduleMessageHistorySave()
+    }
+
+    private fun updateMessageTurnId(threadId: String, messageId: String, turnId: String) {
+        _uiState.update { state ->
+            val messages = state.messagesByThread[threadId].orEmpty()
+            val updated = messages.map { message ->
+                if (message.id == messageId) {
+                    message.copy(turnId = turnId)
+                } else {
+                    message
+                }
+            }
+            state.copy(messagesByThread = state.messagesByThread + (threadId to updated))
+        }
+        scheduleMessageHistorySave()
     }
 
     private suspend fun sendRequest(method: String, params: JsonObject?): RpcMessage {
@@ -1121,7 +1091,7 @@ class RemodexRepository(
         )
         secureSession = session.copy(nextOutboundCounter = session.nextOutboundCounter + 1)
         if (!socketClient.send(json.encodeToString(SecureEnvelope.serializer(), envelope))) {
-            error("Relay WebSocket is not open.")
+            throw IllegalStateException("Relay WebSocket is not connected")
         }
     }
 
@@ -1137,237 +1107,16 @@ class RemodexRepository(
         }
     }
 
-    private suspend fun tryResolvedTrustedSession(savedSession: SavedRelaySession): SavedRelaySession? = withContext(Dispatchers.IO) {
-        val trustedRegistry = storage.readTrustedRegistry()
-        val trustedMac = trustedRegistry.records[savedSession.macDeviceId] ?: return@withContext null
-        val relayUrl = trustedMac.relayUrl ?: return@withContext null
-        val nonce = UUID.randomUUID().toString()
-        val timestamp = System.currentTimeMillis()
-        val transcript = SecureTransportCrypto.buildTrustedSessionResolveTranscript(
-            macDeviceId = trustedMac.macDeviceId,
-            phoneDeviceId = phoneIdentity.phoneDeviceId,
-            phoneIdentityPublicKey = phoneIdentity.phoneIdentityPublicKey,
-            nonce = nonce,
-            timestamp = timestamp,
-        )
-        val request = TrustedSessionResolveRequest(
-            macDeviceId = trustedMac.macDeviceId,
-            phoneDeviceId = phoneIdentity.phoneDeviceId,
-            phoneIdentityPublicKey = phoneIdentity.phoneIdentityPublicKey,
-            nonce = nonce,
-            timestamp = timestamp,
-            signature = SecureTransportCrypto.signEd25519(phoneIdentity.phoneIdentityPrivateKey, transcript),
-        )
-        val resolveUrl = trustedSessionResolveUrl(relayUrl) ?: return@withContext null
-        val httpRequest = Request.Builder()
-            .url(resolveUrl)
-            .post(json.encodeToString(TrustedSessionResolveRequest.serializer(), request).toRequestBody("application/json".toMediaType()))
-            .build()
-        val response = okHttpClient.newCall(httpRequest).execute()
-        val body = response.body?.string().orEmpty()
-        if (!response.isSuccessful) {
-            return@withContext null
+    private fun scheduleMessageHistorySave() {
+        messageHistorySaveJob?.cancel()
+        messageHistorySaveJob = scope.launch {
+            delay(1_000L)
+            messageHistoryStore.save(_uiState.value.messagesByThread)
         }
-        val resolved = runCatching {
-            json.decodeFromString(TrustedSessionResolveResponse.serializer(), body)
-        }.getOrNull() ?: return@withContext null
-        val updated = savedSession.copy(
-            relay = relayUrl,
-            sessionId = resolved.sessionId,
-            macIdentityPublicKey = resolved.macIdentityPublicKey,
-        )
-        storage.writeRelaySession(updated)
-        return@withContext updated
-    }
-
-    private fun parseThreadHistory(threadId: String, threadObject: JsonObject): List<ConversationMessage> {
-        val results = mutableListOf<ConversationMessage>()
-        val seen = LinkedHashSet<String>()
-        parseHistoryArray(
-            threadId = threadId,
-            array = threadObject["messages"].jsonArrayOrNull(),
-            turnId = null,
-            out = results,
-            seen = seen,
-        )
-        threadObject["turns"].jsonArrayOrNull()?.forEach { turnElement ->
-            val turnObject = turnElement.jsonObjectOrNull() ?: return@forEach
-            val turnId = extractTurnId(turnObject)
-            parseTurnInput(threadId, turnId, turnObject, results, seen)
-            parseHistoryArray(threadId, turnObject["messages"].jsonArrayOrNull(), turnId, results, seen)
-            parseHistoryArray(threadId, turnObject["items"].jsonArrayOrNull(), turnId, results, seen)
-            parseHistoryArray(threadId, turnObject["events"].jsonArrayOrNull(), turnId, results, seen)
-        }
-        return results.sortedBy { it.createdAtMillis }
-    }
-
-    private fun parseTurnInput(
-        threadId: String,
-        turnId: String?,
-        turnObject: JsonObject,
-        out: MutableList<ConversationMessage>,
-        seen: MutableSet<String>,
-    ) {
-        val inputItems = turnObject["input"].jsonArrayOrNull() ?: return
-        val text = inputItems.mapNotNull { item ->
-            item.jsonObjectOrNull()?.stringOrNull("text")
-        }.joinToString("\n").trim()
-        if (text.isBlank()) {
-            return
-        }
-        val key = "turn-input-${turnId ?: UUID.randomUUID()}"
-        if (!seen.add(key)) {
-            return
-        }
-        out += ConversationMessage(
-            id = key,
-            threadId = threadId,
-            role = MessageRole.USER,
-            text = text,
-            turnId = turnId,
-            createdAtMillis = turnObject.longOrNull("createdAt", "created_at") ?: System.currentTimeMillis(),
-        )
-    }
-
-    private fun parseHistoryArray(
-        threadId: String,
-        array: JsonArray?,
-        turnId: String?,
-        out: MutableList<ConversationMessage>,
-        seen: MutableSet<String>,
-    ) {
-        array?.forEach { element ->
-            val item = element.jsonObjectOrNull() ?: return@forEach
-            val message = historyMessageFromObject(threadId, turnId, item) ?: return@forEach
-            if (seen.add(message.id)) {
-                out += message
-            }
-        }
-    }
-
-    private fun historyMessageFromObject(threadId: String, turnId: String?, item: JsonObject): ConversationMessage? {
-        val type = item.stringOrNull("type")?.lowercase().orEmpty()
-        val role = when {
-            item.stringOrNull("role") == "user" || type.contains("user") -> MessageRole.USER
-            item.stringOrNull("role") == "assistant" || type.contains("agent_message") || type.contains("assistant") -> MessageRole.ASSISTANT
-            else -> MessageRole.SYSTEM
-        }
-        val text = extractCompletedText(item) ?: extractDelta(item) ?: return null
-        val id = item.stringOrNull("id", "itemId", "item_id", "messageId", "message_id")
-            ?: "${role.name.lowercase()}-${UUID.randomUUID()}"
-        return ConversationMessage(
-            id = id,
-            threadId = threadId,
-            role = role,
-            kind = if (type.contains("reasoning")) MessageKind.THINKING else MessageKind.CHAT,
-            text = text,
-            turnId = extractTurnId(item) ?: turnId,
-            itemId = item.stringOrNull("itemId", "item_id", "callId", "call_id"),
-            createdAtMillis = item.longOrNull("createdAt", "created_at") ?: System.currentTimeMillis(),
-            isStreaming = false,
-        )
-    }
-
-    private fun extractThreadId(payload: JsonObject?): String? {
-        payload ?: return null
-        return payload.stringOrNull("threadId", "thread_id", "conversationId", "conversation_id")
-            ?: payload["thread"].jsonObjectOrNull()?.stringOrNull("id")
-            ?: payload["turn"].jsonObjectOrNull()?.stringOrNull("threadId", "thread_id")
-            ?: payload["event"].jsonObjectOrNull()?.stringOrNull("threadId", "thread_id")
-    }
-
-    private fun extractTurnId(payload: JsonObject?): String? {
-        payload ?: return null
-        return payload.stringOrNull("turnId", "turn_id")
-            ?: payload["turn"].jsonObjectOrNull()?.stringOrNull("id")
-            ?: payload["event"].jsonObjectOrNull()?.stringOrNull("turnId", "turn_id")
-            ?: payload["item"].jsonObjectOrNull()?.stringOrNull("turnId", "turn_id")
-    }
-
-    private fun extractItemId(payload: JsonObject?): String? {
-        payload ?: return null
-        return payload.stringOrNull("itemId", "item_id", "callId", "call_id", "messageId", "message_id")
-            ?: payload["item"].jsonObjectOrNull()?.stringOrNull("id", "itemId", "item_id")
-    }
-
-    private fun extractDelta(payload: JsonObject?): String? {
-        payload ?: return null
-        return payload.stringOrNull("delta", "text", "summary", "part")
-            ?: payload["event"].jsonObjectOrNull()?.stringOrNull("delta", "text")
-            ?: payload["item"].jsonObjectOrNull()?.stringOrNull("delta", "text")
-    }
-
-    private fun extractCompletedText(payload: JsonObject?): String? {
-        payload ?: return null
-        payload.stringOrNull("message", "text", "summary")?.let { return it }
-        payload["content"].jsonArrayOrNull()?.mapNotNull { element ->
-            element.jsonObjectOrNull()?.stringOrNull("text")
-        }?.joinToString("")?.takeIf { it.isNotBlank() }?.let { return it }
-        payload["item"].jsonObjectOrNull()?.stringOrNull("text", "message")?.let { return it }
-        payload["event"].jsonObjectOrNull()?.stringOrNull("text", "message", "summary")?.let { return it }
-        return payload["error"].jsonObjectOrNull()?.stringOrNull("message")
     }
 
     private fun logError(message: String, error: Throwable) {
         Log.e("Remodex", message, error)
     }
 
-    private fun websocketSessionUrl(savedSession: SavedRelaySession): String {
-        val relay = savedSession.relay.trim().trimEnd('/')
-            .replaceFirst("http://", "ws://")
-            .replaceFirst("https://", "wss://")
-        return "$relay/${savedSession.sessionId}"
-    }
-
-    private fun trustedSessionResolveUrl(relayUrl: String): String? {
-        val parsed = relayUrl.trim()
-            .replaceFirst("ws://", "http://")
-            .replaceFirst("wss://", "https://")
-            .toHttpUrlOrNull() ?: return null
-        val pathSegments = parsed.pathSegments.filter { it.isNotBlank() }
-        val builder = parsed.newBuilder()
-        builder.encodedPath(
-            if (pathSegments.lastOrNull() == "relay") {
-                "/" + (pathSegments.dropLast(1) + listOf("v1", "trusted", "session", "resolve")).joinToString("/")
-            } else {
-                "/v1/trusted/session/resolve"
-            },
-        )
-        return builder.build().toString()
-    }
-
-    private fun RelaySocketTerminalEvent.toUserFacingError(): String = when (this) {
-        is RelaySocketTerminalEvent.Closed -> when (code) {
-            4001 -> "The relay rejected this phone because the Mac bridge is not connected for the scanned session. Restart the bridge and scan a fresh QR code."
-            4002 -> "The Mac bridge is temporarily unavailable for this relay session. Try reconnecting."
-            4003 -> "The relay says this pairing session is no longer valid. Scan a fresh QR code."
-            4004 -> "The relay disconnected while the Mac was temporarily absent. Try reconnecting."
-            else -> "Relay WebSocket closed${if (code != 1000) " with code $code" else ""}${reason.takeIf { it.isNotBlank() }?.let { ": $it" } ?: "."}"
-        }
-        is RelaySocketTerminalEvent.Failure -> "Relay WebSocket failed${responseCode?.let { " with HTTP $it" } ?: ""}: $message"
-    }
-
-    private fun userFacingConnectionError(error: Throwable): String {
-        val message = error.message ?: return "Could not connect to the relay."
-        return when {
-            message.contains("CLEARTEXT", ignoreCase = true) ->
-                "Android blocked the local ws:// relay. Reinstall this build and try again."
-            message.contains("Failed to connect", ignoreCase = true) ->
-                "Could not reach the relay host. Confirm the phone and Mac are on the same network and the bridge is running."
-            else -> message
-        }
-    }
-
-    private fun redactRelayUrlForLog(url: String): String {
-        val parsed = url.toHttpUrlOrNull() ?: return "relay=[redacted]"
-        val encodedPath = parsed.encodedPath
-        val redactedPath = if (encodedPath.isBlank() || encodedPath == "/") {
-            encodedPath
-        } else {
-            encodedPath.substringBeforeLast("/", missingDelimiterValue = "").ifBlank { "" } + "/[session]"
-        }
-        val defaultPort = if (parsed.scheme == "https" || parsed.scheme == "wss") 443 else 80
-        val port = if (parsed.port != defaultPort) ":${parsed.port}" else ""
-        return "${parsed.scheme}://${parsed.host}$port$redactedPath"
-    }
 }

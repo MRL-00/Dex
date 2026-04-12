@@ -68,6 +68,115 @@ data class GitCreateBranchResult(
     val branch: String?,
 )
 
+enum class DiffFileAction(val label: String) {
+    EDITED("Edited"),
+    ADDED("Added"),
+    DELETED("Deleted"),
+    RENAMED("Renamed"),
+}
+
+data class DiffFileChunk(
+    val path: String,
+    val action: DiffFileAction,
+    val additions: Int,
+    val deletions: Int,
+    val diffText: String,
+) {
+    val compactPath: String
+        get() = path.substringAfterLast('/')
+
+    val directoryPath: String?
+        get() {
+            val idx = path.lastIndexOf('/')
+            return if (idx > 0) path.substring(0, idx) else null
+        }
+}
+
+fun splitUnifiedDiffByFile(patch: String): List<DiffFileChunk> {
+    val lines = patch.lines()
+    if (lines.isEmpty()) return emptyList()
+
+    val chunks = mutableListOf<DiffFileChunk>()
+    val currentLines = mutableListOf<String>()
+
+    fun flushChunk() {
+        if (currentLines.isEmpty()) return
+        val path = extractDiffPath(currentLines)
+        if (path.isEmpty()) {
+            currentLines.clear()
+            return
+        }
+        val action = detectDiffAction(currentLines)
+        val additions = currentLines.count { it.startsWith("+") && !it.startsWith("+++") }
+        val deletions = currentLines.count { it.startsWith("-") && !it.startsWith("---") }
+        chunks.add(
+            DiffFileChunk(
+                path = path,
+                action = action,
+                additions = additions,
+                deletions = deletions,
+                diffText = currentLines.joinToString("\n"),
+            ),
+        )
+        currentLines.clear()
+    }
+
+    for (line in lines) {
+        if (line.startsWith("diff --git ") && currentLines.isNotEmpty()) {
+            flushChunk()
+        }
+        currentLines.add(line)
+    }
+    flushChunk()
+    return chunks
+}
+
+private fun extractDiffPath(lines: List<String>): String {
+    for (line in lines) {
+        if (line.startsWith("+++ ")) {
+            val value = normalizeDiffPath(line.removePrefix("+++ "))
+            if (value.isNotEmpty() && value != "/dev/null") return value
+        }
+    }
+    for (line in lines) {
+        if (line.startsWith("--- ")) {
+            val value = normalizeDiffPath(line.removePrefix("--- "))
+            if (value.isNotEmpty() && value != "/dev/null") return value
+        }
+    }
+    for (line in lines) {
+        if (line.startsWith("diff --git ")) {
+            val parts = line.split(" ")
+            if (parts.size >= 4) {
+                val value = normalizeDiffPath(parts[3])
+                if (value.isNotEmpty()) return value
+            }
+        }
+    }
+    return ""
+}
+
+private fun normalizeDiffPath(raw: String): String {
+    var value = raw.trim()
+    if (value.startsWith("a/") || value.startsWith("b/")) {
+        value = value.substring(2)
+    }
+    return value
+}
+
+private fun detectDiffAction(lines: List<String>): DiffFileAction {
+    if (lines.any { it.startsWith("rename from ") || it.startsWith("rename to ") }) {
+        return DiffFileAction.RENAMED
+    }
+    if (lines.any { it.startsWith("new file mode ") || it == "--- /dev/null" }) {
+        return DiffFileAction.ADDED
+    }
+    if (lines.any { it.startsWith("deleted file mode ") || it == "+++ /dev/null" }) {
+        return DiffFileAction.DELETED
+    }
+    return DiffFileAction.EDITED
+}
+
 fun parseGitRepoSyncResult(obj: JsonObject): GitRepoSyncResult {
     val filesArray = obj["files"]?.jsonArrayOrNull()
     val files = filesArray?.mapNotNull { f ->
@@ -77,20 +186,20 @@ fun parseGitRepoSyncResult(obj: JsonObject): GitRepoSyncResult {
         GitFileStatus(path, status)
     } ?: emptyList()
 
-    val diffObj = obj["diffTotals"]?.jsonObjectOrNull()
+    val diffObj = obj["diff"]?.jsonObjectOrNull() ?: obj["diffTotals"]?.jsonObjectOrNull()
     val diffTotals = diffObj?.let {
         GitDiffTotals(
             additions = it.longOrNull("additions")?.toInt() ?: 0,
             deletions = it.longOrNull("deletions")?.toInt() ?: 0,
-            filesChanged = it.longOrNull("filesChanged")?.toInt() ?: 0,
+            filesChanged = it.longOrNull("filesChanged", "binaryFiles")?.toInt() ?: 0,
         )
-    }
+    }?.takeIf { totals -> totals.additions > 0 || totals.deletions > 0 || totals.filesChanged > 0 }
 
     return GitRepoSyncResult(
-        repoRoot = obj.stringOrNull("repoRoot"),
+        repoRoot = obj.stringOrNull("repoRoot", "repo_root"),
         branch = obj.stringOrNull("branch"),
         tracking = obj.stringOrNull("tracking"),
-        isDirty = obj.boolOrNull("isDirty") ?: false,
+        isDirty = obj.boolOrNull("isDirty", "dirty") ?: false,
         ahead = obj.longOrNull("ahead")?.toInt() ?: 0,
         behind = obj.longOrNull("behind")?.toInt() ?: 0,
         files = files,
