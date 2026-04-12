@@ -50,6 +50,10 @@ class RemodexRepository(
     private val okHttpClient: OkHttpClient = OkHttpClient(),
     var notificationService: RemodexNotificationService? = null,
 ) {
+    private companion object {
+        const val SIDEBAR_HISTORY_PREFETCH_LIMIT = 12
+    }
+
     private val json = Json {
         encodeDefaults = true
         ignoreUnknownKeys = true
@@ -89,6 +93,7 @@ class RemodexRepository(
         notificationServiceProvider = { notificationService },
         sendRpc = ::sendRpc,
         refreshGitStatus = ::gitStatus,
+        requestThreadHistoryRefresh = ::requestThreadHistoryRefresh,
         handleRateLimitsUpdated = ::handleRateLimitsUpdated,
         scheduleMessageHistorySave = ::scheduleMessageHistorySave,
     )
@@ -220,6 +225,7 @@ class RemodexRepository(
             ?: JsonArray(emptyList())
         val threads = page.mapNotNull { it.jsonObjectOrNull()?.let(::threadSummaryFromJson) }
         var selectedThreadIdToRefresh: String? = null
+        var threadIdsToPrefetch: List<String> = emptyList()
         _uiState.update { state ->
             val resolvedSelectedThreadId = when {
                 state.selectedThreadId != null && threads.any { thread -> thread.id == state.selectedThreadId } -> {
@@ -235,6 +241,17 @@ class RemodexRepository(
             if (shouldRefreshSelectedThread) {
                 selectedThreadIdToRefresh = resolvedSelectedThreadId
             }
+            threadIdsToPrefetch = threads
+                .asSequence()
+                .filterNot { it.isArchived }
+                .map { it.id }
+                .filter { threadId ->
+                    threadId != resolvedSelectedThreadId &&
+                        state.messagesByThread[threadId].orEmpty().isEmpty() &&
+                        !threadHistoryRefreshJobs.containsKey(threadId)
+                }
+                .take(SIDEBAR_HISTORY_PREFETCH_LIMIT)
+                .toList()
             state.copy(
                 threads = threads,
                 selectedThreadId = resolvedSelectedThreadId,
@@ -247,6 +264,7 @@ class RemodexRepository(
         }
         gitCoordinator.prefetchGitStatusForThreads(threads)
         selectedThreadIdToRefresh?.let(::requestThreadHistoryRefresh)
+        threadIdsToPrefetch.forEach(::requestThreadHistoryRefresh)
     }
 
     fun hasCompletedOnboarding(): Boolean = storage.hasCompletedOnboarding()
@@ -1044,7 +1062,7 @@ class RemodexRepository(
         }
         if (envelope.counter <= session.lastInboundCounter) {
             Log.d(
-                "Remodex",
+                "Dex",
                 "Ignoring stale secure envelope counter=${envelope.counter} last=${session.lastInboundCounter}",
             )
             return

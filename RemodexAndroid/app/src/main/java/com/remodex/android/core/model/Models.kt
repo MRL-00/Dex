@@ -222,6 +222,7 @@ enum class MessageKind {
     THINKING,
     TOOL_ACTIVITY,
     COMMAND_EXECUTION,
+    FILE_CHANGE,
     APPROVAL,
 }
 
@@ -248,6 +249,7 @@ fun namespacedConversationMessageId(
         MessageKind.THINKING -> "thinking"
         MessageKind.TOOL_ACTIVITY -> "tool"
         MessageKind.COMMAND_EXECUTION -> "command"
+        MessageKind.FILE_CHANGE -> "file-change"
         MessageKind.APPROVAL -> "approval"
         MessageKind.CHAT -> when (role) {
             MessageRole.USER -> "user"

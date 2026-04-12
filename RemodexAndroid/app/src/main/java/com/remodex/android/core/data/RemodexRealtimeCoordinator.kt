@@ -33,6 +33,7 @@ internal class RemodexRealtimeCoordinator(
     private val notificationServiceProvider: () -> com.remodex.android.core.notification.RemodexNotificationService?,
     private val sendRpc: suspend (RpcMessage) -> Unit,
     private val refreshGitStatus: suspend (String) -> Unit,
+    private val requestThreadHistoryRefresh: (String) -> Unit,
     private val handleRateLimitsUpdated: (JsonObject?) -> Unit,
     private val scheduleMessageHistorySave: () -> Unit,
 ) {
@@ -144,6 +145,7 @@ internal class RemodexRealtimeCoordinator(
                         planStateByThread = it.planStateByThread - threadId,
                     )
                 }
+                requestThreadHistoryRefresh(threadId)
                 if (!isAppInForeground.get()) {
                     notificationServiceProvider()?.notifyRunCompletion(threadId, threadTitle(threadId), isSuccess)
                 }
@@ -186,6 +188,31 @@ internal class RemodexRealtimeCoordinator(
             "item/reasoning/delta", "codex/event/reasoning_delta" -> {
                 val threadId = extractThreadId(params) ?: uiState.value.selectedThreadId ?: return
                 appendThinkingDelta(threadId, extractTurnId(params), extractItemId(params), extractDelta(params) ?: return)
+            }
+
+            "item/fileChange/outputDelta" -> {
+                val threadId = extractThreadId(params) ?: uiState.value.selectedThreadId ?: return
+                appendFileChangeDelta(
+                    threadId = threadId,
+                    turnId = extractTurnId(params),
+                    itemId = extractItemId(params),
+                    delta = extractDelta(params) ?: return,
+                )
+            }
+
+            "item/toolCall/outputDelta",
+            "item/toolCall/output_delta",
+            "item/tool_call/outputDelta",
+            "item/tool_call/output_delta" -> {
+                val threadId = extractThreadId(params) ?: uiState.value.selectedThreadId ?: return
+                val decoded = RemodexFileChangeFormatter.decodePayloadText(params)
+                val delta = decoded ?: extractDelta(params) ?: return
+                appendFileChangeDelta(
+                    threadId = threadId,
+                    turnId = extractTurnId(params),
+                    itemId = extractItemId(params),
+                    delta = delta,
+                )
             }
 
             "item/toolUse/started", "item/tool/started", "codex/event/tool_use_begin" -> {
@@ -244,10 +271,35 @@ internal class RemodexRealtimeCoordinator(
 
             "item/completed", "codex/event/item_completed", "codex/event/agent_message" -> {
                 val threadId = extractThreadId(params) ?: uiState.value.selectedThreadId ?: return
+                val fileChangeText = RemodexFileChangeFormatter.decodePayloadText(params)
+                if (!fileChangeText.isNullOrBlank()) {
+                    completeFileChangeMessage(
+                        threadId = threadId,
+                        turnId = extractTurnId(params),
+                        itemId = extractItemId(params),
+                        text = fileChangeText,
+                    )
+                    return
+                }
                 val text = extractCompletedText(params)
                 if (!text.isNullOrBlank()) {
                     completeAssistantMessage(threadId, extractTurnId(params), extractItemId(params), text)
                 }
+            }
+
+            "turn/diff/updated", "codex/event/turn_diff_updated", "codex/event/turn_diff" -> {
+                val threadId = extractThreadId(params) ?: uiState.value.selectedThreadId ?: return
+                val diffText = params?.stringOrNull("diff", "unified_diff")
+                    ?: params?.get("event")?.jsonObjectOrNull()?.stringOrNull("diff", "unified_diff")
+                    ?: return
+                completeFileChangeMessage(
+                    threadId = threadId,
+                    turnId = extractTurnId(params),
+                    itemId = extractItemId(params),
+                    text = RemodexFileChangeFormatter.decodePayloadText(
+                        JsonObject(mapOf("diff" to JsonPrimitive(diffText))),
+                    ) ?: return,
+                )
             }
 
             "repo/changed", "repo/refreshSignal" -> {
@@ -352,6 +404,70 @@ internal class RemodexRealtimeCoordinator(
                     turnId = turnId,
                     itemId = itemId,
                     isStreaming = true,
+                )
+            }
+            state.copy(messagesByThread = state.messagesByThread + (threadId to messages))
+        }
+        scheduleMessageHistorySave()
+    }
+
+    private fun appendFileChangeDelta(threadId: String, turnId: String?, itemId: String?, delta: String) {
+        uiState.update { state ->
+            val messages = state.messagesByThread[threadId].orEmpty().toMutableList()
+            val existingIndex = messages.indexOfLast {
+                it.kind == MessageKind.FILE_CHANGE &&
+                    ((itemId != null && it.itemId == itemId) || (turnId != null && it.turnId == turnId)) &&
+                    it.isStreaming
+            }
+            if (existingIndex >= 0) {
+                val current = messages[existingIndex]
+                messages[existingIndex] = current.copy(text = current.text + delta, isStreaming = true)
+            } else {
+                messages += ConversationMessage(
+                    id = itemId?.let {
+                        namespacedConversationMessageId(it, MessageRole.SYSTEM, MessageKind.FILE_CHANGE)
+                    } ?: "file-change-${UUID.randomUUID()}",
+                    threadId = threadId,
+                    role = MessageRole.SYSTEM,
+                    kind = MessageKind.FILE_CHANGE,
+                    text = delta,
+                    turnId = turnId,
+                    itemId = itemId,
+                    isStreaming = true,
+                )
+            }
+            state.copy(messagesByThread = state.messagesByThread + (threadId to messages))
+        }
+        scheduleMessageHistorySave()
+    }
+
+    private fun completeFileChangeMessage(threadId: String, turnId: String?, itemId: String?, text: String) {
+        uiState.update { state ->
+            val messages = state.messagesByThread[threadId].orEmpty().toMutableList()
+            val existingIndex = messages.indexOfLast {
+                it.kind == MessageKind.FILE_CHANGE &&
+                    ((itemId != null && it.itemId == itemId) || (turnId != null && it.turnId == turnId))
+            }
+            if (existingIndex >= 0) {
+                messages[existingIndex] = messages[existingIndex].copy(
+                    role = MessageRole.SYSTEM,
+                    text = text,
+                    turnId = turnId ?: messages[existingIndex].turnId,
+                    itemId = itemId ?: messages[existingIndex].itemId,
+                    isStreaming = false,
+                )
+            } else {
+                messages += ConversationMessage(
+                    id = itemId?.let {
+                        namespacedConversationMessageId(it, MessageRole.SYSTEM, MessageKind.FILE_CHANGE)
+                    } ?: "file-change-${UUID.randomUUID()}",
+                    threadId = threadId,
+                    role = MessageRole.SYSTEM,
+                    kind = MessageKind.FILE_CHANGE,
+                    text = text,
+                    turnId = turnId,
+                    itemId = itemId,
+                    isStreaming = false,
                 )
             }
             state.copy(messagesByThread = state.messagesByThread + (threadId to messages))

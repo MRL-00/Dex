@@ -354,7 +354,7 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                                         )
                                         Spacer(Modifier.height(16.dp))
                                         Text(
-                                            "Hi! How can I help?",
+                                            "Build something great!",
                                             style = MaterialTheme.typography.titleLarge,
                                         )
                                         Spacer(Modifier.height(6.dp))

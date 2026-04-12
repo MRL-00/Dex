@@ -140,18 +140,24 @@ internal object RemodexConversationHistoryParser {
         val isCommandExecution = type.contains("commandexecution")
             || type.contains("command_execution")
             || type.contains("exec_command")
+        val fileChangeText = RemodexFileChangeFormatter.decodePayloadText(item)
+        val isFileChange = fileChangeText != null
         val kind = when {
+            isFileChange -> MessageKind.FILE_CHANGE
             type.contains("reasoning") -> MessageKind.THINKING
             isCommandExecution -> MessageKind.COMMAND_EXECUTION
             else -> MessageKind.CHAT
         }
         val role = when {
+            isFileChange -> MessageRole.SYSTEM
             isCommandExecution -> MessageRole.SYSTEM
             item.stringOrNull("role") == "user" || type.contains("user") -> MessageRole.USER
             item.stringOrNull("role") == "assistant" || type.contains("agent_message") || type.contains("assistant") -> MessageRole.ASSISTANT
             else -> MessageRole.SYSTEM
         }
-        val text = if (kind == MessageKind.COMMAND_EXECUTION) {
+        val text = if (kind == MessageKind.FILE_CHANGE) {
+            fileChangeText ?: return null
+        } else if (kind == MessageKind.COMMAND_EXECUTION) {
             RemodexCommandExecutionFormatter.historyText(item, type)
         } else {
             extractCompletedText(item) ?: extractDelta(item)

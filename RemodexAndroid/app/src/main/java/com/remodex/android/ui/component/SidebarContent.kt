@@ -2,7 +2,6 @@ package com.remodex.android.ui.component
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -14,6 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -33,12 +33,14 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -46,19 +48,21 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.zIndex
+import com.remodex.android.core.model.ConversationDiffSummaryCalculator
+import com.remodex.android.core.model.ConversationDiffTotals
 import com.remodex.android.core.model.RemodexUiState
 import com.remodex.android.core.model.ThreadSummary
+import sh.calvin.reorderable.ReorderableCollectionItemScope
+import sh.calvin.reorderable.ReorderableItem
+import sh.calvin.reorderable.rememberReorderableLazyListState
 
-private val SidebarDiffGreen = androidx.compose.ui.graphics.Color(0xFF22C55E)
-private val SidebarDiffRed = androidx.compose.ui.graphics.Color(0xFFF04444)
+private val SidebarDiffGreen = Color(0xFF22C55E)
+private val SidebarDiffRed = Color(0xFFF04444)
 private const val NoProjectGroupId = "__no_project__"
 
 private data class ProjectGroup(
@@ -99,30 +103,6 @@ private fun synchronizedProjectOrder(
     }
 
     return ordered
-}
-
-private fun moveProjectOrderToIndex(
-    currentOrder: List<String>,
-    projectId: String,
-    destinationIndex: Int,
-): List<String> {
-    val currentIndex = currentOrder.indexOf(projectId)
-    if (currentIndex == -1) return currentOrder
-
-    val safeDestinationIndex = destinationIndex.coerceIn(0, currentOrder.lastIndex)
-    if (safeDestinationIndex == currentIndex) return currentOrder
-
-    val reordered = currentOrder.toMutableList()
-    val moved = reordered.removeAt(currentIndex)
-    reordered.add(safeDestinationIndex, moved)
-    return reordered
-}
-
-private fun headerKeyForProject(groupId: String): String = "header_$groupId"
-
-private fun projectIdFromHeaderKey(key: Any?): String? {
-    val rawKey = key as? String ?: return null
-    return rawKey.removePrefix("header_").takeIf { rawKey.startsWith("header_") }
 }
 
 private fun groupThreadsByProject(
@@ -184,16 +164,33 @@ fun SidebarContent(
     val expandedGroups = remember { mutableStateMapOf<String, Boolean>() }
     var showNewChatChooser by remember { mutableStateOf(false) }
     var isEditingProjectOrder by remember { mutableStateOf(false) }
-    val listState = rememberLazyListState()
-    var draggingProjectId by remember { mutableStateOf<String?>(null) }
-    var draggingProjectOffsetY by remember { mutableStateOf(0f) }
+    val editableProjectGroups = remember { mutableStateListOf<ProjectGroup>() }
 
     val allProjectGroups = groupThreadsByProject(uiState.threads, projectOrder)
     val synchronizedOrder = synchronizedProjectOrder(projectOrder, allProjectGroups)
+    val reorderableListState = rememberLazyListState()
+    val reorderableState = rememberReorderableLazyListState(reorderableListState) { from, to ->
+        if (from.index !in editableProjectGroups.indices || to.index !in editableProjectGroups.indices) {
+            return@rememberReorderableLazyListState
+        }
+
+        val updated = editableProjectGroups.toMutableList().apply {
+            add(to.index, removeAt(from.index))
+        }
+        editableProjectGroups.clear()
+        editableProjectGroups.addAll(updated)
+        onProjectOrderChanged(updated.map { it.id })
+    }
 
     LaunchedEffect(synchronizedOrder) {
         if (synchronizedOrder != projectOrder) {
             onProjectOrderChanged(synchronizedOrder)
+        }
+    }
+    LaunchedEffect(isEditingProjectOrder, allProjectGroups, synchronizedOrder) {
+        if (isEditingProjectOrder) {
+            editableProjectGroups.clear()
+            editableProjectGroups.addAll(allProjectGroups.filter { it.projectPath != null })
         }
     }
 
@@ -206,8 +203,12 @@ fun SidebarContent(
                 projectGroupLabel(thread.cwd).contains(searchQuery, ignoreCase = true)
         }
     }
+    val threadDiffTotalsById = remember(uiState.messagesByThread) {
+        uiState.messagesByThread.mapValues { (_, messages) ->
+            ConversationDiffSummaryCalculator.totals(messages)
+        }
+    }
     val projectGroups = groupThreadsByProject(filteredThreads, synchronizedOrder)
-
     val connectedMacName = uiState.trustedMacs.values
         .maxByOrNull { it.lastUsedAt ?: it.lastPairedAt }
         ?.displayName
@@ -223,10 +224,10 @@ fun SidebarContent(
         ) {
             RemodexBrandIcon(
                 modifier = Modifier.size(60.dp),
-                contentDescription = "Remodex app icon",
+                contentDescription = "Dex app icon",
             )
             Spacer(Modifier.width(12.dp))
-            Text("Remodex", style = MaterialTheme.typography.titleLarge)
+            Text("Dex", style = MaterialTheme.typography.titleLarge)
         }
 
         Spacer(Modifier.height(14.dp))
@@ -330,30 +331,67 @@ fun SidebarContent(
             }
         }
 
-        LazyColumn(
-            modifier = Modifier.weight(1f),
-            state = listState,
-        ) {
-            projectGroups.forEach { group ->
+        if (isEditingProjectOrder) {
+            if (editableProjectGroups.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .padding(horizontal = 20.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "No repos to reorder yet.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    state = reorderableListState,
+                ) {
+                    items(editableProjectGroups, key = { it.id }) { group ->
+                        ReorderableItem(reorderableState, key = group.id) { isDragging ->
+                            SidebarProjectReorderItem(
+                                group = group,
+                                isDragging = isDragging,
+                                scope = this,
+                            )
+                        }
+                    }
+
+                    val noRepoGroup = allProjectGroups.firstOrNull { it.projectPath == null }
+                    if (noRepoGroup != null) {
+                        item(key = "no_repo_hint") {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                            ) {
+                                Text(
+                                    "No Repo stays below the ordered repo list.",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            LazyColumn(modifier = Modifier.weight(1f)) {
+                projectGroups.forEach { group ->
                 val isCollapsed = expandedGroups[group.id] != true
                 val groupDiffTotals = group.threads
                     .asSequence()
                     .mapNotNull { thread -> uiState.gitStatusByThread[thread.id]?.diffTotals }
                     .firstOrNull { totals -> totals.additions > 0 || totals.deletions > 0 }
-                val repoOnlyOrder = synchronizedOrder
 
-                item(key = headerKeyForProject(group.id)) {
+                item(key = "header_${group.id}") {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .graphicsLayer {
-                                translationY = if (draggingProjectId == group.id) {
-                                    draggingProjectOffsetY
-                                } else {
-                                    0f
-                                }
-                            }
-                            .zIndex(if (draggingProjectId == group.id) 1f else 0f)
                             .clickable { expandedGroups[group.id] = isCollapsed }
                             .padding(horizontal = 16.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -398,69 +436,6 @@ fun SidebarContent(
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
-                        if (isEditingProjectOrder && group.projectPath != null) {
-                            Icon(
-                                Icons.Rounded.DragHandle,
-                                contentDescription = "Drag to reorder ${group.name}",
-                                modifier = Modifier
-                                    .size(22.dp)
-                                    .pointerInput(group.id, repoOnlyOrder, projectGroups) {
-                                        detectDragGestures(
-                                            onDragStart = {
-                                                draggingProjectId = group.id
-                                                draggingProjectOffsetY = 0f
-                                            },
-                                            onDragEnd = {
-                                                draggingProjectId = null
-                                                draggingProjectOffsetY = 0f
-                                            },
-                                            onDragCancel = {
-                                                draggingProjectId = null
-                                                draggingProjectOffsetY = 0f
-                                            },
-                                        ) { change, dragAmount ->
-                                            change.consume()
-                                            draggingProjectOffsetY += dragAmount.y
-
-                                            val draggedItemInfo = listState.layoutInfo.visibleItemsInfo
-                                                .firstOrNull { itemInfo ->
-                                                    projectIdFromHeaderKey(itemInfo.key) == group.id
-                                                } ?: return@detectDragGestures
-
-                                            val draggedMidpoint =
-                                                draggedItemInfo.offset + (draggedItemInfo.size / 2f) + draggingProjectOffsetY
-
-                                            val targetItemInfo = listState.layoutInfo.visibleItemsInfo
-                                                .filter { itemInfo ->
-                                                    val projectId = projectIdFromHeaderKey(itemInfo.key)
-                                                    projectId != null && projectId != group.id
-                                                }
-                                                .firstOrNull { itemInfo ->
-                                                    draggedMidpoint >= itemInfo.offset &&
-                                                        draggedMidpoint <= itemInfo.offset + itemInfo.size
-                                                } ?: return@detectDragGestures
-
-                                            val targetProjectId = projectIdFromHeaderKey(targetItemInfo.key)
-                                                ?: return@detectDragGestures
-                                            val targetIndex = repoOnlyOrder.indexOf(targetProjectId)
-                                            if (targetIndex == -1) return@detectDragGestures
-
-                                            val reordered = moveProjectOrderToIndex(
-                                                currentOrder = repoOnlyOrder,
-                                                projectId = group.id,
-                                                destinationIndex = targetIndex,
-                                            )
-                                            if (reordered != repoOnlyOrder) {
-                                                onProjectOrderChanged(reordered)
-                                                draggingProjectOffsetY +=
-                                                    (draggedItemInfo.offset - targetItemInfo.offset).toFloat()
-                                            }
-                                        }
-                                    },
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
-                            )
-                            Spacer(Modifier.width(4.dp))
-                        }
                         Icon(
                             if (isCollapsed) Icons.Rounded.ExpandMore else Icons.Rounded.ExpandLess,
                             contentDescription = if (isCollapsed) "Expand" else "Collapse",
@@ -480,6 +455,7 @@ fun SidebarContent(
                         val isRunning = thread.id in uiState.runningThreadIds
                         val timeAgo = formatTimeAgo(thread.updatedAtMillis)
                         val displayTitle = thread.title.ifBlank { "New Thread" }
+                        val threadDiffTotals = threadDiffTotalsById[thread.id]
 
                         Row(
                             modifier = Modifier
@@ -516,6 +492,10 @@ fun SidebarContent(
                                     MaterialTheme.colorScheme.onSurfaceVariant
                                 },
                             )
+                            if (threadDiffTotals != null) {
+                                Spacer(Modifier.width(8.dp))
+                                SidebarThreadDiffTotalsLabel(threadDiffTotals)
+                            }
                             if (timeAgo.isNotBlank()) {
                                 Spacer(Modifier.width(8.dp))
                                 Text(
@@ -526,6 +506,7 @@ fun SidebarContent(
                             }
                         }
                     }
+                }
                 }
             }
         }
@@ -654,6 +635,89 @@ fun SidebarContent(
                     Text("Cancel")
                 }
             },
+        )
+    }
+
+}
+
+@Composable
+private fun SidebarProjectReorderItem(
+    group: ProjectGroup,
+    isDragging: Boolean,
+    scope: ReorderableCollectionItemScope,
+) {
+    Surface(
+        color = if (isDragging) {
+            MaterialTheme.colorScheme.surfaceContainerHigh
+        } else {
+            MaterialTheme.colorScheme.surface
+        },
+        tonalElevation = if (isDragging) 4.dp else 0.dp,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Rounded.Computer,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    group.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                group.projectPath?.let { projectPath ->
+                    Text(
+                        projectPath,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            IconButton(
+                modifier = with(scope) {
+                    Modifier.draggableHandle()
+                },
+                onClick = {},
+            ) {
+                Icon(
+                    Icons.Rounded.DragHandle,
+                    contentDescription = "Reorder ${group.name}",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.9f),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SidebarThreadDiffTotalsLabel(totals: ConversationDiffTotals) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "+${totals.additions}",
+            style = MaterialTheme.typography.labelSmall,
+            color = SidebarDiffGreen,
+        )
+        Spacer(Modifier.width(2.dp))
+        Text(
+            "-${totals.deletions}",
+            style = MaterialTheme.typography.labelSmall,
+            color = SidebarDiffRed,
         )
     }
 }

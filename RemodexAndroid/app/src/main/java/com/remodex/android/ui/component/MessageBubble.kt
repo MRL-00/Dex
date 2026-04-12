@@ -51,7 +51,9 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.remodex.android.core.attachment.ImageAttachmentPipeline
+import com.remodex.android.core.model.ConversationFileChangeSummaryParser
 import com.remodex.android.core.model.ConversationMessage
+import com.remodex.android.core.model.DiffFileAction
 import com.remodex.android.core.model.ImageAttachment
 import com.remodex.android.core.model.MessageKind
 import com.remodex.android.core.model.MessageRole
@@ -124,25 +126,38 @@ private fun UserBubble(message: ConversationMessage) {
 }
 
 /**
- * Assistant messages: left-aligned, no card background — plain text directly on
- * the page background, matching the iOS chat appearance.
+ * Assistant messages: left-aligned bubble with surface background.
  */
 @Composable
 private fun AssistantMessage(message: ConversationMessage) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 2.dp)
-            .animateContentSize(),
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Start,
     ) {
-        RichMessageText(
-            text = message.text,
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            textStyle = chatBodyTextStyle(),
-        )
-        if (message.isStreaming) {
-            Spacer(Modifier.height(6.dp))
-            StreamingIndicator()
+        Card(
+            shape = RoundedCornerShape(
+                topStart = 4.dp,
+                topEnd = 20.dp,
+                bottomStart = 20.dp,
+                bottomEnd = 20.dp,
+            ),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+            ),
+            modifier = Modifier.widthIn(max = 320.dp),
+        ) {
+            Column(Modifier.padding(12.dp, 10.dp).animateContentSize()) {
+                RichMessageText(
+                    text = message.text,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    textStyle = chatBodyTextStyle(),
+                )
+                if (message.isStreaming) {
+                    Spacer(Modifier.height(6.dp))
+                    StreamingIndicator()
+                }
+            }
         }
     }
 }
@@ -624,76 +639,21 @@ private fun DiffCodeBlock(
 }
 
 private fun parseFileChangeGroups(text: String): List<FileChangeGroup>? {
-    val groups = mutableListOf<FileChangeGroup>()
-    var currentLabel: String? = null
-    var currentEntries = mutableListOf<FileChangeEntry>()
-
-    fun flushGroup() {
-        if (currentEntries.isEmpty()) return
-        groups += FileChangeGroup(currentLabel ?: "Edited", currentEntries.toList())
-        currentEntries = mutableListOf()
-    }
-
-    for (rawLine in text.lines()) {
-        val line = rawLine.trim()
-        if (line.isEmpty()) {
-            flushGroup()
-            currentLabel = null
-            continue
-        }
-
-        val actionOnlyMatch = actionOnlyRegex.matchEntire(line)
-        if (actionOnlyMatch != null) {
-            flushGroup()
-            currentLabel = normalizeActionLabel(actionOnlyMatch.groupValues[1])
-            continue
-        }
-
-        val actionAndTotalsMatch = actionAndTotalsRegex.matchEntire(line)
-        if (actionAndTotalsMatch != null) {
-            val label = normalizeActionLabel(actionAndTotalsMatch.groupValues[1])
-            val path = actionAndTotalsMatch.groupValues[2].trim()
-            if (!looksLikeFilePath(path)) return null
-            if (currentLabel != null && currentLabel != label) {
-                flushGroup()
-            }
-            currentLabel = label
-            currentEntries += FileChangeEntry(
-                path = path,
-                additions = actionAndTotalsMatch.groupValues[3].toInt(),
-                deletions = actionAndTotalsMatch.groupValues[4].toInt(),
+    val summary = ConversationFileChangeSummaryParser.parse(text) ?: return null
+    return summary.entries
+        .groupBy { entry -> entry.action?.label ?: DiffFileAction.EDITED.label }
+        .map { (label, entries) ->
+            FileChangeGroup(
+                label = label,
+                entries = entries.map { entry ->
+                    FileChangeEntry(
+                        path = entry.path,
+                        additions = entry.additions,
+                        deletions = entry.deletions,
+                    )
+                },
             )
-            continue
         }
-
-        val pathAndTotalsMatch = pathAndTotalsRegex.matchEntire(line)
-        if (pathAndTotalsMatch != null) {
-            val path = pathAndTotalsMatch.groupValues[1].trim()
-            if (!looksLikeFilePath(path)) return null
-            currentEntries += FileChangeEntry(
-                path = path,
-                additions = pathAndTotalsMatch.groupValues[2].toInt(),
-                deletions = pathAndTotalsMatch.groupValues[3].toInt(),
-            )
-            continue
-        }
-
-        return null
-    }
-
-    flushGroup()
-    return groups.takeIf { it.isNotEmpty() }
-}
-
-private fun normalizeActionLabel(value: String): String {
-    return value.trim().lowercase().replaceFirstChar { it.uppercase() }
-}
-
-private fun looksLikeFilePath(value: String): Boolean {
-    if (value.contains("/") || value.contains("\\") || value.contains(".")) {
-        return true
-    }
-    return value in setOf("README", "Dockerfile", "Makefile", "Podfile", "Gemfile")
 }
 
 private fun parseCommandExecutionStatus(text: String): CommandExecutionStatus {
@@ -834,12 +794,4 @@ private data class CommandExecutionStatus(
     val verb: String,
     val target: String,
     val statusLabel: String,
-)
-
-private val actionOnlyRegex = Regex("(?i)^(edited|updated|added|created|deleted|removed|renamed|moved)\\s*$")
-private val actionAndTotalsRegex = Regex(
-    "(?i)^(edited|updated|added|created|deleted|removed|renamed|moved)\\s+(.+?)\\s+[+＋]\\s*(\\d+)\\s*[-−–—﹣－]\\s*(\\d+)\\s*$",
-)
-private val pathAndTotalsRegex = Regex(
-    "^(.+?)\\s+[+＋]\\s*(\\d+)\\s*[-−–—﹣－]\\s*(\\d+)\\s*$",
 )
