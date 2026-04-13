@@ -38,6 +38,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.decodeFromJsonElement
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -302,6 +303,51 @@ class RemodexRepository(
         storage.writeSidebarProjectOrder(order)
     }
 
+    suspend fun listSkills(
+        cwds: List<String>?,
+        forceReload: Boolean = false,
+    ): List<RemodexSkillMetadata> {
+        val normalizedCwds = cwds.orEmpty()
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+        val requestParams = buildMap<String, JsonElement> {
+            if (normalizedCwds.isNotEmpty()) {
+                put("cwds", JsonArray(normalizedCwds.map(::JsonPrimitive)))
+            }
+            if (forceReload) {
+                put("forceReload", JsonPrimitive(true))
+            }
+        }
+
+        val response = try {
+            sendRequest("skills/list", JsonObject(requestParams))
+        } catch (error: Exception) {
+            if (normalizedCwds.isEmpty() || !shouldRetrySkillsListWithCwdFallback(error)) {
+                throw error
+            }
+
+            val fallbackParams = buildMap<String, JsonElement> {
+                put("cwd", JsonPrimitive(normalizedCwds.first()))
+                if (forceReload) {
+                    put("forceReload", JsonPrimitive(true))
+                }
+            }
+            sendRequest("skills/list", JsonObject(fallbackParams))
+        }
+
+        val decodedSkills = decodeSkillMetadata(response.result)
+            ?: throw IllegalStateException("skills/list response missing result.data[].skills")
+
+        return decodedSkills
+            .groupBy { it.normalizedName }
+            .values
+            .mapNotNull { bucket ->
+                bucket.firstOrNull { it.enabled } ?: bucket.firstOrNull()
+            }
+            .filter { it.name.trim().isNotEmpty() }
+            .sortedBy { it.normalizedName }
+    }
+
     suspend fun openThread(threadId: String) {
         _uiState.update { state ->
             val hasCachedMessages = state.messagesByThread[threadId].orEmpty().isNotEmpty()
@@ -318,10 +364,27 @@ class RemodexRepository(
         requestThreadHistoryRefresh(threadId)
     }
 
-    suspend fun sendTurn(threadId: String, text: String, attachments: List<ImageAttachment> = emptyList()) {
+    suspend fun sendTurn(
+        threadId: String,
+        text: String,
+        attachments: List<ImageAttachment> = emptyList(),
+        skillMentions: List<RemodexTurnSkillMention> = emptyList(),
+    ) {
         val trimmed = text.trim()
         val sanitizedAttachments = attachments.map { it.sanitizedForMessage() }
-        if (trimmed.isEmpty() && sanitizedAttachments.isEmpty()) {
+        val sanitizedSkillMentions = skillMentions.mapNotNull { mention ->
+            val id = mention.id.trim()
+            if (id.isEmpty()) {
+                null
+            } else {
+                RemodexTurnSkillMention(
+                    id = id,
+                    name = mention.name?.trim()?.takeIf(String::isNotEmpty),
+                    path = mention.path?.trim()?.takeIf(String::isNotEmpty),
+                )
+            }
+        }
+        if (trimmed.isEmpty() && sanitizedAttachments.isEmpty() && sanitizedSkillMentions.isEmpty()) {
             return
         }
         val localMessageId = UUID.randomUUID().toString()
@@ -356,6 +419,15 @@ class RemodexRepository(
                         ),
                     ),
                 )
+            }
+            sanitizedSkillMentions.forEach { mention ->
+                val payload = mutableMapOf<String, JsonElement>(
+                    "type" to JsonPrimitive("skill"),
+                    "id" to JsonPrimitive(mention.id),
+                )
+                mention.name?.let { payload["name"] = JsonPrimitive(it) }
+                mention.path?.let { payload["path"] = JsonPrimitive(it) }
+                add(JsonObject(payload))
             }
         }
         val input = JsonArray(inputItems)
@@ -1172,6 +1244,48 @@ class RemodexRepository(
 
     private fun logError(message: String, error: Throwable) {
         Log.e("Remodex", message, error)
+    }
+
+    private fun decodeSkillMetadata(result: JsonElement?): List<RemodexSkillMetadata>? {
+        val resultObject = result.jsonObjectOrNull() ?: return null
+
+        val collectedSkills = mutableListOf<RemodexSkillMetadata>()
+        var hasSkillContainer = false
+
+        resultObject["data"]?.jsonArrayOrNull()?.let { dataItems ->
+            hasSkillContainer = true
+            dataItems.forEach { item ->
+                val itemObject = item.jsonObjectOrNull() ?: return@forEach
+                val skillsValue = itemObject["skills"] ?: return@forEach
+                runCatching {
+                    json.decodeFromJsonElement<List<RemodexSkillMetadata>>(skillsValue)
+                }.getOrNull()?.let(collectedSkills::addAll)
+            }
+
+            if (collectedSkills.isEmpty()) {
+                runCatching {
+                    json.decodeFromJsonElement<List<RemodexSkillMetadata>>(dataItems)
+                }.getOrNull()?.let(collectedSkills::addAll)
+            }
+        }
+
+        resultObject["skills"]?.let { skillsValue ->
+            hasSkillContainer = true
+            runCatching {
+                json.decodeFromJsonElement<List<RemodexSkillMetadata>>(skillsValue)
+            }.getOrNull()?.let(collectedSkills::addAll)
+        }
+
+        return if (hasSkillContainer) collectedSkills else null
+    }
+
+    private fun shouldRetrySkillsListWithCwdFallback(error: Throwable): Boolean {
+        val message = error.message?.lowercase().orEmpty()
+        return message.contains("invalid params") ||
+            message.contains("invalid parameters") ||
+            message.contains("unexpected parameter") ||
+            message.contains("unknown field") ||
+            message.contains("invalid")
     }
 
 }

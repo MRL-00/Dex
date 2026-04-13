@@ -6,6 +6,8 @@ import com.remodex.android.core.data.RemodexRepository
 import com.remodex.android.core.model.AccessMode
 import com.remodex.android.core.model.GitDiffResult
 import com.remodex.android.core.model.ImageAttachment
+import com.remodex.android.core.model.RemodexSkillMetadata
+import com.remodex.android.core.model.RemodexTurnSkillMention
 import com.remodex.android.core.model.RemodexUiState
 import com.remodex.android.core.model.ThreadRuntimeOverride
 import com.remodex.android.core.security.QrPairingValidationResult
@@ -36,6 +38,8 @@ class RemodexAppViewModel(
     var voiceTranscribing by mutableStateOf(false)
         private set
     private val transcriptionClient = GptTranscriptionClient()
+    private val cachedSkillsByCwd = mutableMapOf<String, List<RemodexSkillMetadata>>()
+    private val unsupportedSkillRoots = mutableSetOf<String>()
 
     fun hasCompletedOnboarding(): Boolean = repository.hasCompletedOnboarding()
 
@@ -106,9 +110,59 @@ class RemodexAppViewModel(
         repository.writeSidebarProjectOrder(order)
     }
 
-    fun sendTurn(threadId: String, text: String, attachments: List<ImageAttachment> = emptyList()) {
+    fun sendTurn(
+        threadId: String,
+        text: String,
+        attachments: List<ImageAttachment> = emptyList(),
+        skillMentions: List<RemodexTurnSkillMention> = emptyList(),
+    ) {
         viewModelScope.launch(exceptionHandler) {
-            repository.sendTurn(threadId, text, attachments)
+            repository.sendTurn(threadId, text, attachments, skillMentions)
+        }
+    }
+
+    fun cachedSkills(cwd: String?): List<RemodexSkillMetadata>? {
+        val normalizedCwd = cwd?.trim()?.takeIf(String::isNotEmpty) ?: return null
+        return cachedSkillsByCwd[normalizedCwd]
+    }
+
+    fun loadSkills(
+        cwd: String?,
+        forceReload: Boolean = false,
+        onComplete: (List<RemodexSkillMetadata>) -> Unit,
+    ) {
+        val normalizedCwd = cwd?.trim()?.takeIf(String::isNotEmpty)
+        if (normalizedCwd == null) {
+            onComplete(emptyList())
+            return
+        }
+
+        if (!forceReload) {
+            cachedSkillsByCwd[normalizedCwd]?.let {
+                onComplete(it)
+                return
+            }
+            if (unsupportedSkillRoots.contains(normalizedCwd)) {
+                onComplete(emptyList())
+                return
+            }
+        }
+
+        viewModelScope.launch {
+            val result = runCatching {
+                repository.listSkills(cwds = listOf(normalizedCwd), forceReload = forceReload)
+            }
+            val skills = result.getOrElse { error ->
+                if (isUnsupportedSkillsMethod(error)) {
+                    unsupportedSkillRoots += normalizedCwd
+                }
+                android.util.Log.w("RemodexAppVM", "skills/list failed for $normalizedCwd", error)
+                emptyList()
+            }
+            if (result.isSuccess) {
+                cachedSkillsByCwd[normalizedCwd] = skills
+            }
+            onComplete(skills)
         }
     }
 
@@ -232,5 +286,12 @@ class RemodexAppViewModel(
                 voiceTranscribing = false
             }
         }
+    }
+
+    private fun isUnsupportedSkillsMethod(error: Throwable): Boolean {
+        val message = error.message?.lowercase().orEmpty()
+        return message.contains("method not found") ||
+            message.contains("unsupported") ||
+            message.contains("-32601")
     }
 }

@@ -12,9 +12,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -54,11 +57,14 @@ import androidx.compose.ui.unit.dp
 import com.remodex.android.core.attachment.ImageAttachmentPipeline
 import com.remodex.android.core.model.AccessMode
 import com.remodex.android.core.model.ContextWindowUsage
+import com.remodex.android.core.model.ComposerSlashCommand
 import com.remodex.android.core.model.GitRepoSyncResult
 import com.remodex.android.core.model.ImageAttachment
 import com.remodex.android.core.model.ModelOption
 import com.remodex.android.core.model.RateLimitBucket
 import com.remodex.android.core.model.ReasoningEffort
+import com.remodex.android.core.model.RemodexSkillMetadata
+import com.remodex.android.core.model.SkillDisplayNameFormatter
 import com.remodex.android.core.model.ThreadRuntimeOverride
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -67,7 +73,17 @@ import androidx.compose.foundation.text.KeyboardOptions
 fun ComposerBar(
     draft: String,
     attachments: List<ImageAttachment> = emptyList(),
+    mentionedSkills: List<RemodexSkillMetadata> = emptyList(),
+    skillAutocompleteItems: List<RemodexSkillMetadata> = emptyList(),
+    skillAutocompleteQuery: String = "",
+    isSkillAutocompleteVisible: Boolean = false,
+    isSkillAutocompleteLoading: Boolean = false,
+    slashAutocompleteQuery: String = "",
+    isSlashAutocompleteVisible: Boolean = false,
     onDraftChange: (String) -> Unit,
+    onSelectSkillAutocomplete: ((RemodexSkillMetadata) -> Unit)? = null,
+    onSelectSlashCommand: ((ComposerSlashCommand) -> Unit)? = null,
+    onRemoveMentionedSkill: ((String) -> Unit)? = null,
     onSend: () -> Unit,
     onInterrupt: () -> Unit,
     isRunning: Boolean,
@@ -136,6 +152,13 @@ fun ComposerBar(
                     )
                 }
 
+                if (mentionedSkills.isNotEmpty() && onRemoveMentionedSkill != null) {
+                    ComposerSkillMentionRow(
+                        skills = mentionedSkills,
+                        onRemove = onRemoveMentionedSkill,
+                    )
+                }
+
                 TextField(
                     value = draft,
                     onValueChange = onDraftChange,
@@ -171,6 +194,20 @@ fun ComposerBar(
                     ),
                     maxLines = 6,
                 )
+
+                if (isSlashAutocompleteVisible && onSelectSlashCommand != null) {
+                    SlashCommandAutocompletePanel(
+                        query = slashAutocompleteQuery,
+                        onSelect = onSelectSlashCommand,
+                    )
+                } else if (isSkillAutocompleteVisible && onSelectSkillAutocomplete != null) {
+                    SkillAutocompletePanel(
+                        items = skillAutocompleteItems,
+                        isLoading = isSkillAutocompleteLoading,
+                        query = skillAutocompleteQuery,
+                        onSelect = onSelectSkillAutocomplete,
+                    )
+                }
 
                 if (isVoiceRecording || isVoiceTranscribing) {
                     VoiceStatusChip(
@@ -511,6 +548,247 @@ private fun ComposerAttachmentPreview(
                             tint = MaterialTheme.colorScheme.onSurface,
                             modifier = Modifier.size(14.dp),
                         )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ComposerSkillMentionRow(
+    skills: List<RemodexSkillMetadata>,
+    onRemove: (String) -> Unit,
+) {
+    Row(
+        modifier = Modifier.horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        skills.forEach { skill ->
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f))
+                    .padding(start = 12.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = SkillDisplayNameFormatter.displayName(skill.name),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = "\$${skill.name}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .size(20.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.9f))
+                        .clickable { onRemove(skill.id) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Rounded.Close,
+                        contentDescription = "Remove skill",
+                        tint = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.size(14.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SkillAutocompletePanel(
+    items: List<RemodexSkillMetadata>,
+    isLoading: Boolean,
+    query: String,
+    onSelect: (RemodexSkillMetadata) -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+        tonalElevation = 2.dp,
+        border = BorderStroke(
+            width = 1.dp,
+            color = MaterialTheme.colorScheme.outline.copy(alpha = 0.12f),
+        ),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp)
+                .heightIn(max = 320.dp),
+        ) {
+            when {
+                isLoading -> {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            modifier = Modifier.size(14.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            text = "Searching skills...",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                items.isEmpty() -> {
+                    Text(
+                        text = "No skills for \$$query",
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                else -> {
+                    LazyColumn {
+                        items(items, key = { it.id }) { skill ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onSelect(skill) }
+                                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.Top,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Text(
+                                        text = SkillDisplayNameFormatter.displayName(skill.name),
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        text = "\$${skill.name}",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    skill.description
+                                        ?.split(Regex("\\s+"))
+                                        ?.joinToString(" ")
+                                        ?.trim()
+                                        ?.takeIf(String::isNotEmpty)
+                                        ?.let { description ->
+                                            Text(
+                                                text = description,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SlashCommandAutocompletePanel(
+    query: String,
+    onSelect: (ComposerSlashCommand) -> Unit,
+) {
+    val items = ComposerSlashCommand.filtered(query)
+    val unsupportedCommands = setOf(
+        ComposerSlashCommand.CODE_REVIEW,
+        ComposerSlashCommand.FORK,
+    )
+
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+        tonalElevation = 2.dp,
+        border = BorderStroke(
+            width = 1.dp,
+            color = MaterialTheme.colorScheme.outline.copy(alpha = 0.12f),
+        ),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp)
+                .heightIn(max = 320.dp),
+        ) {
+            if (items.isEmpty()) {
+                Text(
+                    text = "No commands for /$query",
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                LazyColumn {
+                    items(items, key = { it.name }) { command ->
+                        val isEnabled = command !in unsupportedCommands
+                        val subtitle = when (command) {
+                            ComposerSlashCommand.CODE_REVIEW -> "Android UI is not wired to review/start yet"
+                            ComposerSlashCommand.FORK -> "Android UI is not wired to thread/fork yet"
+                            else -> command.subtitle
+                        }
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(enabled = isEnabled) { onSelect(command) }
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.Top,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Text(
+                                    text = command.title,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = if (isEnabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = command.commandToken,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (isEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                )
+                                Text(
+                                    text = subtitle,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
                     }
                 }
             }

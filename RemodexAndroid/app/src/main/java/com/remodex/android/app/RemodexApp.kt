@@ -1,23 +1,14 @@
 package com.remodex.android.app
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
-import android.util.Size
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,15 +24,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.MoreVert
-import androidx.compose.material.icons.rounded.QrCodeScanner
-import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -68,7 +55,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -82,17 +68,18 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.google.mlkit.vision.barcode.BarcodeScanning
-import com.google.mlkit.vision.common.InputImage
 import com.remodex.android.core.attachment.ImageAttachmentPipeline
+import com.remodex.android.core.model.ComposerSlashCommand
 import com.remodex.android.core.model.ConversationDiffSummaryCalculator
 import com.remodex.android.core.model.ImageAttachment
 import com.remodex.android.core.model.RelayConnectionState
+import com.remodex.android.core.model.RemodexSkillMetadata
+import com.remodex.android.core.model.RemodexTurnSkillMention
+import com.remodex.android.core.model.SkillAutocompleteLogic
+import com.remodex.android.core.model.SlashCommandLogic
 import com.remodex.android.core.model.timelineLazyKey
 import com.remodex.android.core.voice.VoicePreflightResult
 import com.remodex.android.core.voice.VoiceRecordingManager
@@ -315,11 +302,81 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                             (contextWindowUsage == null || !uiState.hasResolvedRateLimitsSnapshot)
                         var draft by rememberSaveable(threadId) { mutableStateOf("") }
                         var composerAttachments by remember(threadId) { mutableStateOf(emptyList<ImageAttachment>()) }
+                        var composerMentionedSkills by remember(threadId) { mutableStateOf(emptyList<RemodexSkillMetadata>()) }
+                        var skillAutocompleteItems by remember(threadId, cwd) { mutableStateOf(emptyList<RemodexSkillMetadata>()) }
+                        var skillAutocompleteQuery by remember(threadId, cwd) { mutableStateOf("") }
+                        var isSkillAutocompleteVisible by remember(threadId, cwd) { mutableStateOf(false) }
+                        var isSkillAutocompleteLoading by remember(threadId, cwd) { mutableStateOf(false) }
+                        var slashAutocompleteQuery by remember(threadId) { mutableStateOf("") }
+                        var isSlashAutocompleteVisible by remember(threadId) { mutableStateOf(false) }
                         var isVoiceRecording by remember(threadId) { mutableStateOf(false) }
 
                         LaunchedEffect(threadId, uiState.isConnected) {
                             if (threadId != null && shouldAutoRefreshUsageStatus) {
                                 viewModel.refreshUsageStatus(threadId)
+                            }
+                        }
+
+                        LaunchedEffect(draft, cwd, uiState.isConnected) {
+                            composerMentionedSkills = SkillAutocompleteLogic.filterMentionedSkills(
+                                text = draft,
+                                mentions = composerMentionedSkills,
+                            )
+
+                            val slashToken = if (uiState.isConnected) {
+                                SlashCommandLogic.trailingSlashCommandToken(draft)
+                            } else {
+                                null
+                            }
+                            if (slashToken != null) {
+                                slashAutocompleteQuery = slashToken.query
+                                isSlashAutocompleteVisible = true
+                                skillAutocompleteItems = emptyList()
+                                skillAutocompleteQuery = ""
+                                isSkillAutocompleteVisible = false
+                                isSkillAutocompleteLoading = false
+                                return@LaunchedEffect
+                            }
+
+                            slashAutocompleteQuery = ""
+                            isSlashAutocompleteVisible = false
+
+                            val token = if (uiState.isConnected) {
+                                SkillAutocompleteLogic.trailingSkillAutocompleteToken(draft)
+                            } else {
+                                null
+                            }
+                            val query = token?.query?.trim().orEmpty()
+
+                            if (cwd.isNullOrBlank() || token == null || query.length < 2) {
+                                skillAutocompleteItems = emptyList()
+                                skillAutocompleteQuery = query
+                                isSkillAutocompleteVisible = false
+                                isSkillAutocompleteLoading = false
+                                return@LaunchedEffect
+                            }
+
+                            skillAutocompleteQuery = query
+                            isSkillAutocompleteVisible = true
+
+                            viewModel.cachedSkills(cwd)?.let { cachedSkills ->
+                                skillAutocompleteItems = filterSkillAutocompleteItems(query, cachedSkills)
+                                isSkillAutocompleteLoading = false
+                            } ?: run {
+                                skillAutocompleteItems = emptyList()
+                                isSkillAutocompleteLoading = true
+                            }
+
+                            val expectedQuery = query
+                            viewModel.loadSkills(cwd) { loadedSkills ->
+                                val currentToken = SkillAutocompleteLogic.trailingSkillAutocompleteToken(draft)
+                                val currentQuery = currentToken?.query?.trim().orEmpty()
+                                if (!currentQuery.equals(expectedQuery, ignoreCase = false)) {
+                                    return@loadSkills
+                                }
+                                skillAutocompleteItems = filterSkillAutocompleteItems(expectedQuery, loadedSkills)
+                                isSkillAutocompleteLoading = false
+                                isSkillAutocompleteVisible = true
                             }
                         }
 
@@ -540,12 +597,90 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                                 ComposerBar(
                                     draft = draft,
                                     attachments = composerAttachments,
-                                    onDraftChange = { draft = it },
+                                    mentionedSkills = composerMentionedSkills,
+                                    skillAutocompleteItems = skillAutocompleteItems,
+                                    skillAutocompleteQuery = skillAutocompleteQuery,
+                                    isSkillAutocompleteVisible = isSkillAutocompleteVisible,
+                                    isSkillAutocompleteLoading = isSkillAutocompleteLoading,
+                                    slashAutocompleteQuery = slashAutocompleteQuery,
+                                    isSlashAutocompleteVisible = isSlashAutocompleteVisible,
+                                    onDraftChange = { updatedDraft ->
+                                        draft = updatedDraft
+                                        composerMentionedSkills = SkillAutocompleteLogic.filterMentionedSkills(
+                                            text = updatedDraft,
+                                            mentions = composerMentionedSkills,
+                                        )
+                                    },
+                                    onSelectSkillAutocomplete = { skill ->
+                                        SkillAutocompleteLogic.replacingTrailingSkillAutocompleteToken(
+                                            text = draft,
+                                            selectedSkill = skill.name,
+                                        )?.let { updatedDraft ->
+                                            draft = updatedDraft
+                                        }
+                                        if (composerMentionedSkills.none { it.id == skill.id }) {
+                                            composerMentionedSkills = composerMentionedSkills + skill
+                                        }
+                                        skillAutocompleteItems = emptyList()
+                                        skillAutocompleteQuery = ""
+                                        isSkillAutocompleteVisible = false
+                                        isSkillAutocompleteLoading = false
+                                        slashAutocompleteQuery = ""
+                                        isSlashAutocompleteVisible = false
+                                    },
+                                    onSelectSlashCommand = { command ->
+                                        when (command) {
+                                            ComposerSlashCommand.STATUS -> {
+                                                draft = SlashCommandLogic.removingTrailingSlashCommandToken(draft) ?: draft
+                                                showUsageStatusSheet = true
+                                            }
+                                            ComposerSlashCommand.SUBAGENTS -> {
+                                                draft = SlashCommandLogic.replacingTrailingSlashCommandToken(
+                                                    text = draft,
+                                                    replacement = command.cannedPrompt.orEmpty(),
+                                                ) ?: draft
+                                            }
+                                            ComposerSlashCommand.CODE_REVIEW,
+                                            ComposerSlashCommand.FORK,
+                                            -> Unit
+                                        }
+                                        slashAutocompleteQuery = ""
+                                        isSlashAutocompleteVisible = false
+                                        skillAutocompleteItems = emptyList()
+                                        skillAutocompleteQuery = ""
+                                        isSkillAutocompleteVisible = false
+                                        isSkillAutocompleteLoading = false
+                                    },
+                                    onRemoveMentionedSkill = { skillId ->
+                                        composerMentionedSkills.firstOrNull { it.id == skillId }?.let { mention ->
+                                            draft = SkillAutocompleteLogic.removingSkillMention(
+                                                text = draft,
+                                                skillName = mention.name,
+                                            )
+                                        }
+                                        composerMentionedSkills = composerMentionedSkills.filterNot { it.id == skillId }
+                                    },
                                     onSend = {
-                                        if (draft.isNotBlank() || composerAttachments.isNotEmpty()) {
-                                            viewModel.sendTurn(threadId, draft, composerAttachments)
+                                        val activeSkillMentions = SkillAutocompleteLogic
+                                            .filterMentionedSkills(draft, composerMentionedSkills)
+                                            .map { skill ->
+                                                RemodexTurnSkillMention(
+                                                    id = skill.name.trim(),
+                                                    name = skill.name.trim(),
+                                                    path = skill.path?.trim()?.takeIf(String::isNotEmpty),
+                                                )
+                                            }
+                                        if (draft.isNotBlank() || composerAttachments.isNotEmpty() || activeSkillMentions.isNotEmpty()) {
+                                            viewModel.sendTurn(threadId, draft, composerAttachments, activeSkillMentions)
                                             draft = ""
                                             composerAttachments = emptyList()
+                                            composerMentionedSkills = emptyList()
+                                            skillAutocompleteItems = emptyList()
+                                            skillAutocompleteQuery = ""
+                                            isSkillAutocompleteVisible = false
+                                            isSkillAutocompleteLoading = false
+                                            slashAutocompleteQuery = ""
+                                            isSlashAutocompleteVisible = false
                                         }
                                     },
                                     onInterrupt = { viewModel.interruptTurn(threadId) },
@@ -755,6 +890,20 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
     }
 }
 
+private fun filterSkillAutocompleteItems(
+    query: String,
+    skills: List<RemodexSkillMetadata>,
+): List<RemodexSkillMetadata> {
+    val needle = query.trim().lowercase()
+    if (needle.isEmpty()) {
+        return emptyList()
+    }
+    return skills.asSequence()
+        .filter { it.searchBlob.contains(needle) }
+        .take(6)
+        .toList()
+}
+
 private fun resolveSelectedGitStatus(
     selectedThread: com.remodex.android.core.model.ThreadSummary?,
     threads: List<com.remodex.android.core.model.ThreadSummary>,
@@ -813,369 +962,5 @@ private fun appendVoiceTranscript(draft: String, transcript: String): String {
         trimmedTranscript
     } else {
         draft.trimEnd() + "\n" + trimmedTranscript
-    }
-}
-
-// ── Pairing Screen ────────────────────────────────────────────────────
-
-@Composable
-private fun PairingScreen(
-    uiState: com.remodex.android.core.model.RemodexUiState,
-    pairingFeedback: String?,
-    onScanned: (String) -> Unit,
-    onReconnect: () -> Unit,
-    onDismissScanner: () -> Unit,
-) {
-    var scannerExpanded by rememberSaveable { mutableStateOf(true) }
-    val isConnecting = uiState.connectionState == RelayConnectionState.CONNECTING ||
-        uiState.connectionState == RelayConnectionState.HANDSHAKING
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .verticalScroll(rememberScrollState()),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Spacer(Modifier.height(80.dp))
-
-        // App icon
-        RemodexBrandIcon(
-            modifier = Modifier
-                .size(72.dp),
-            contentDescription = "Remodex app icon",
-        )
-
-        Spacer(Modifier.height(20.dp))
-
-        Text(
-            "Dex",
-            style = MaterialTheme.typography.headlineLarge,
-        )
-
-        Spacer(Modifier.height(8.dp))
-
-        Text(
-            "Pair with your Mac to get started",
-            style = MaterialTheme.typography.bodyLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-
-        // Connection status indicator
-        if (isConnecting) {
-            Spacer(Modifier.height(16.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(16.dp),
-                    strokeWidth = 2.dp,
-                    color = MaterialTheme.colorScheme.secondary,
-                )
-                Text(
-                    if (uiState.connectionState == RelayConnectionState.HANDSHAKING) "Securing..." else "Connecting...",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.secondary,
-                )
-            }
-        }
-
-        // Error feedback
-        if (!pairingFeedback.isNullOrBlank()) {
-            Spacer(Modifier.height(16.dp))
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 24.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                shape = RoundedCornerShape(14.dp),
-            ) {
-                Text(
-                    text = pairingFeedback,
-                    modifier = Modifier.padding(14.dp),
-                    color = MaterialTheme.colorScheme.onErrorContainer,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-        }
-
-        Spacer(Modifier.height(28.dp))
-
-        // QR scanner
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 24.dp),
-        ) {
-            // Scanner viewport
-            AnimatedVisibility(scannerExpanded) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp)),
-                ) {
-                    QrScannerView(onDetected = onScanned)
-                }
-            }
-
-            Spacer(Modifier.height(16.dp))
-
-            // Action buttons
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                OutlinedButton(
-                    onClick = { scannerExpanded = !scannerExpanded },
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(12.dp),
-                ) {
-                    Icon(
-                        Icons.Rounded.QrCodeScanner,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(if (scannerExpanded) "Hide Scanner" else "Scan QR")
-                }
-
-                if (uiState.hasSavedPairing) {
-                    Button(
-                        onClick = {
-                            scannerExpanded = false
-                            onDismissScanner()
-                            onReconnect()
-                        },
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(12.dp),
-                        enabled = !isConnecting,
-                    ) {
-                        if (isConnecting) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp),
-                                strokeWidth = 2.dp,
-                                color = MaterialTheme.colorScheme.onPrimary,
-                            )
-                        } else {
-                            Icon(
-                                Icons.Rounded.Refresh,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp),
-                            )
-                        }
-                        Spacer(Modifier.width(6.dp))
-                        Text("Reconnect")
-                    }
-                }
-            }
-        }
-
-        Spacer(Modifier.height(24.dp))
-
-//        // Manual code entry (collapsible)
-//        Column(
-//            modifier = Modifier
-//                .fillMaxWidth()
-//                .padding(horizontal = 24.dp),
-//        ) {
-//            Row(
-//                modifier = Modifier
-//                    .fillMaxWidth()
-//                    .clickable { showManualEntry = !showManualEntry }
-//                    .padding(vertical = 8.dp),
-//                verticalAlignment = Alignment.CenterVertically,
-//            ) {
-//                Text(
-//                    "Paste pairing code",
-//                    style = MaterialTheme.typography.titleSmall,
-//                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-//                )
-//                Spacer(Modifier.weight(1f))
-//                Text(
-//                    if (showManualEntry) "Hide" else "Show",
-//                    style = MaterialTheme.typography.labelMedium,
-//                    color = MaterialTheme.colorScheme.primary,
-//                )
-//            }
-//
-//            AnimatedVisibility(showManualEntry) {
-//                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-//                    OutlinedTextField(
-//                        value = manualPairingCode,
-//                        onValueChange = onManualPairingCodeChanged,
-//                        modifier = Modifier.fillMaxWidth(),
-//                        minLines = 3,
-//                        maxLines = 6,
-//                        placeholder = {
-//                            Text(
-//                                """{"v":2,"relay":"ws://..."}""",
-//                                style = MaterialTheme.typography.bodySmall,
-//                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
-//                            )
-//                        },
-//                        shape = RoundedCornerShape(12.dp),
-//                    )
-//                    Button(
-//                        onClick = onSubmitManualCode,
-//                        enabled = manualPairingCode.isNotBlank() && !isConnecting,
-//                        modifier = Modifier.fillMaxWidth(),
-//                        shape = RoundedCornerShape(12.dp),
-//                    ) {
-//                        if (isConnecting) {
-//                            CircularProgressIndicator(
-//                                modifier = Modifier.size(16.dp),
-//                                strokeWidth = 2.dp,
-//                                color = MaterialTheme.colorScheme.onPrimary,
-//                            )
-//                            Spacer(Modifier.width(8.dp))
-//                        }
-//                        Text("Connect")
-//                    }
-//                }
-//            }
-//        }
-
-        Spacer(Modifier.height(40.dp))
-
-        // Status label at bottom
-        if (uiState.errorMessage != null &&
-            uiState.connectionState != RelayConnectionState.CONNECTING &&
-            uiState.connectionState != RelayConnectionState.HANDSHAKING) {
-            Text(
-                uiState.errorMessage,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-                modifier = Modifier.padding(horizontal = 24.dp),
-                textAlign = TextAlign.Center,
-            )
-        } else {
-            Text(
-                uiState.secureStatusLabel,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-            )
-        }
-
-        Spacer(Modifier.height(32.dp))
-    }
-}
-
-// ── QR Scanner ────────────────────────────────────────────────────────
-
-@SuppressLint("UnsafeOptInUsageError")
-@Composable
-private fun QrScannerView(onDetected: (String) -> Unit) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
-    val latestOnDetected by rememberUpdatedState(onDetected)
-    var permissionGranted by rememberSaveable {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED,
-        )
-    }
-    val permissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-    ) { granted -> permissionGranted = granted }
-
-    LaunchedEffect(Unit) {
-        if (!permissionGranted) permissionLauncher.launch(Manifest.permission.CAMERA)
-    }
-
-    if (!permissionGranted) {
-        Card(shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(16.dp)) {
-                Text("Camera permission is required to scan the pairing QR code.")
-                Spacer(Modifier.height(8.dp))
-                Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
-                    Text("Allow camera")
-                }
-            }
-        }
-        return
-    }
-
-    val scanner = remember { BarcodeScanning.getClient() }
-    var handled by remember { mutableStateOf(false) }
-    val previewView = remember {
-        PreviewView(context).apply {
-            scaleType = PreviewView.ScaleType.FILL_CENTER
-            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-        }
-    }
-
-    DisposableEffect(permissionGranted, previewView, handled) {
-        if (!permissionGranted) {
-            onDispose { }
-        } else if (handled) {
-            if (cameraProviderFuture.isDone) {
-                runCatching { cameraProviderFuture.get().unbindAll() }
-            }
-            onDispose { }
-        } else {
-            val executor = ContextCompat.getMainExecutor(context)
-            var disposed = false
-            val bindCamera = Runnable {
-                if (disposed) return@Runnable
-                val cameraProvider = cameraProviderFuture.get()
-                val preview = Preview.Builder().build().also {
-                    it.surfaceProvider = previewView.surfaceProvider
-                }
-                val analysis = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(1280, 720))
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .build()
-                analysis.setAnalyzer(executor) { imageProxy ->
-                    val mediaImage = imageProxy.image
-                    if (mediaImage == null || handled) {
-                        imageProxy.close()
-                        return@setAnalyzer
-                    }
-                    val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-                    scanner.process(image)
-                        .addOnSuccessListener { barcodes ->
-                            val raw = barcodes.firstNotNullOfOrNull { it.rawValue }
-                            if (!handled && raw != null) {
-                                handled = true
-                                runCatching { cameraProvider.unbindAll() }
-                                latestOnDetected(raw)
-                            }
-                        }
-                        .addOnCompleteListener { imageProxy.close() }
-                }
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
-                    lifecycleOwner,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview,
-                    analysis,
-                )
-            }
-            cameraProviderFuture.addListener(bindCamera, executor)
-            onDispose {
-                disposed = true
-                if (cameraProviderFuture.isDone) {
-                    runCatching { cameraProviderFuture.get().unbindAll() }
-                }
-            }
-        }
-    }
-
-    AndroidView(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(280.dp)
-            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(18.dp)),
-        factory = { previewView },
-    )
-
-    DisposableEffect(Unit) {
-        onDispose {
-            if (cameraProviderFuture.isDone) {
-                runCatching { cameraProviderFuture.get().unbindAll() }
-            }
-            runCatching { scanner.close() }
-        }
     }
 }
