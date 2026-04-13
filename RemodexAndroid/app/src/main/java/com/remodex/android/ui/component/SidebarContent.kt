@@ -383,11 +383,6 @@ fun SidebarContent(
             LazyColumn(modifier = Modifier.weight(1f)) {
                 projectGroups.forEach { group ->
                 val isCollapsed = expandedGroups[group.id] != true
-                val groupDiffTotals = group.threads
-                    .asSequence()
-                    .mapNotNull { thread -> uiState.gitStatusByThread[thread.id]?.diffTotals }
-                    .firstOrNull { totals -> totals.additions > 0 || totals.deletions > 0 }
-
                 item(key = "header_${group.id}") {
                     Row(
                         modifier = Modifier
@@ -411,20 +406,6 @@ fun SidebarContent(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        if (groupDiffTotals != null) {
-                            Text(
-                                "+${groupDiffTotals.additions}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = SidebarDiffGreen,
-                            )
-                            Spacer(Modifier.width(2.dp))
-                            Text(
-                                "-${groupDiffTotals.deletions}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = SidebarDiffRed,
-                            )
-                            Spacer(Modifier.width(4.dp))
-                        }
                         IconButton(
                             onClick = { onStartThreadInProject(group.projectPath) },
                             modifier = Modifier.size(28.dp),

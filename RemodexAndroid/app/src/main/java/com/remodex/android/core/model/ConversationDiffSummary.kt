@@ -51,6 +51,25 @@ object ConversationFileChangeSummaryParser {
             }
     }
 
+    fun chunks(text: String): List<DiffFileChunk> {
+        val unifiedDiff = extractUnifiedDiff(text) ?: text.trim().takeIf { it.contains("diff --git ") }
+        val explicitChunks = unifiedDiff?.let(::splitUnifiedDiffByFile).orEmpty()
+        if (explicitChunks.isNotEmpty()) {
+            return explicitChunks
+        }
+
+        val summary = parse(text) ?: return emptyList()
+        return summary.entries.map { entry ->
+            DiffFileChunk(
+                path = entry.path,
+                action = entry.action ?: DiffFileAction.EDITED,
+                additions = entry.additions,
+                deletions = entry.deletions,
+                diffText = buildFallbackDiffText(entry),
+            )
+        }
+    }
+
     private fun parseGroupedSummary(text: String): ConversationFileChangeSummary? {
         val entries = mutableListOf<ConversationFileChangeSummaryEntry>()
         var currentAction: DiffFileAction? = null
@@ -314,6 +333,14 @@ object ConversationFileChangeSummaryParser {
             value.contains(".") ||
             value in setOf("README", "Dockerfile", "Makefile", "Podfile", "Gemfile")
     }
+
+    private fun buildFallbackDiffText(entry: ConversationFileChangeSummaryEntry): String {
+        return buildString {
+            appendLine("Path: ${entry.path}")
+            entry.action?.let { appendLine("Kind: ${it.label}") }
+            append("Totals: +${entry.additions} -${entry.deletions}")
+        }
+    }
 }
 
 object ConversationDiffSummaryCalculator {
@@ -344,6 +371,41 @@ object ConversationDiffSummaryCalculator {
             deletions = deletions,
             distinctDiffCount = distinctDiffCount,
         ).takeIf { it.hasChanges }
+    }
+
+    fun chunks(messages: List<ConversationMessage>): List<DiffFileChunk> {
+        val relevantMessages = messagesAfterMostRecentPush(messages)
+        val seenKeys = linkedSetOf<String>()
+        val mergedChunks = linkedMapOf<String, DiffFileChunk>()
+
+        relevantMessages.forEach { message ->
+            if (message.isStreaming || message.role != MessageRole.SYSTEM || message.kind != MessageKind.FILE_CHANGE) {
+                return@forEach
+            }
+            val summary = ConversationFileChangeSummaryParser.parse(message.text) ?: return@forEach
+            val dedupeKey = ConversationFileChangeSummaryParser.dedupeKey(summary)
+            val turnScope = message.turnId?.trim()?.takeIf(String::isNotBlank) ?: "message-id:${message.id}"
+            if (!seenKeys.add("$turnScope|$dedupeKey")) {
+                return@forEach
+            }
+
+            ConversationFileChangeSummaryParser.chunks(message.text).forEach { chunk ->
+                val existing = mergedChunks[chunk.path]
+                if (existing == null) {
+                    mergedChunks[chunk.path] = chunk
+                } else {
+                    mergedChunks[chunk.path] = existing.copy(
+                        additions = existing.additions + chunk.additions,
+                        deletions = existing.deletions + chunk.deletions,
+                        diffText = listOf(existing.diffText, chunk.diffText)
+                            .filter { it.isNotBlank() }
+                            .joinToString("\n\n"),
+                    )
+                }
+            }
+        }
+
+        return mergedChunks.values.toList()
     }
 
     private fun messagesAfterMostRecentPush(messages: List<ConversationMessage>): List<ConversationMessage> {

@@ -29,8 +29,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import com.remodex.android.core.model.GitRepoSyncResult
 import androidx.compose.foundation.clickable
+import com.remodex.android.core.model.GitRepoSyncResult
 
 /**
  * Git actions bottom sheet menu matching the iOS layout.
@@ -179,12 +179,12 @@ private fun GitMenuItem(
  */
 @Composable
 fun DiffStatsBadge(
-    gitStatus: GitRepoSyncResult?,
+    additions: Int,
+    deletions: Int,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val totals = gitStatus?.diffTotals ?: return
-    if (totals.additions == 0 && totals.deletions == 0) return
+    if (additions == 0 && deletions == 0) return
     val diffGreen = androidx.compose.ui.graphics.Color(0xFF22C55E)
     val diffRed = androidx.compose.ui.graphics.Color(0xFFF04444)
 
@@ -200,12 +200,12 @@ fun DiffStatsBadge(
         horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(4.dp),
     ) {
         Text(
-            "+${totals.additions}",
+            "+$additions",
             style = MaterialTheme.typography.labelSmall,
             color = diffGreen,
         )
         Text(
-            "-${totals.deletions}",
+            "-$deletions",
             style = MaterialTheme.typography.labelSmall,
             color = diffRed,
         )

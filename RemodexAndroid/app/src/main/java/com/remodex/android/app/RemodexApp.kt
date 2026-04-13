@@ -90,6 +90,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
 import com.remodex.android.core.attachment.ImageAttachmentPipeline
+import com.remodex.android.core.model.ConversationDiffSummaryCalculator
 import com.remodex.android.core.model.ImageAttachment
 import com.remodex.android.core.model.RelayConnectionState
 import com.remodex.android.core.model.timelineLazyKey
@@ -124,7 +125,8 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
     var showOnboarding by rememberSaveable { mutableStateOf(!viewModel.hasCompletedOnboarding()) }
     var showScanner by rememberSaveable { mutableStateOf(!uiState.hasSavedPairing) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
-    var showDiffSheet by rememberSaveable { mutableStateOf(false) }
+    var showRepoDiffSheet by rememberSaveable { mutableStateOf(false) }
+    var showThreadDiffSheet by rememberSaveable { mutableStateOf(false) }
     var showBranchSelector by rememberSaveable { mutableStateOf(false) }
     var showGitActions by rememberSaveable { mutableStateOf(false) }
     var showUsageStatusSheet by rememberSaveable { mutableStateOf(false) }
@@ -149,10 +151,19 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
     }
 
     // Auto-fetch git status when selected thread changes
-    val selectedCwd = uiState.selectedThreadId?.let { tid ->
-        uiState.threads.find { it.id == tid }?.cwd
+    val selectedThread = uiState.selectedThreadId?.let { tid ->
+        uiState.threads.find { it.id == tid }
     }
-    val selectedGitStatus = uiState.selectedThreadId?.let { uiState.gitStatusByThread[it] } ?: uiState.gitStatus
+    val selectedCwd = selectedThread?.cwd
+    val selectedGitStatus = resolveSelectedGitStatus(
+        selectedThread = selectedThread,
+        threads = uiState.threads,
+        gitStatusByThread = uiState.gitStatusByThread,
+        fallbackGitStatus = uiState.gitStatus,
+    )
+    val selectedThreadMessages = selectedThread?.id?.let { uiState.messagesByThread[it].orEmpty() }.orEmpty()
+    val selectedThreadDiffTotals = ConversationDiffSummaryCalculator.totals(selectedThreadMessages)
+    val selectedThreadDiffChunks = ConversationDiffSummaryCalculator.chunks(selectedThreadMessages)
     val shouldShowErrorBanner = uiState.errorMessage != null &&
         uiState.connectionState != RelayConnectionState.CONNECTING &&
         uiState.connectionState != RelayConnectionState.HANDSHAKING
@@ -233,7 +244,6 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                     },
                 ) {
                     val threadId = uiState.selectedThreadId
-                    val selectedThread = threadId?.let { tid -> uiState.threads.find { it.id == tid } }
                     val cwd = selectedThread?.cwd
 
                     Scaffold(
@@ -269,12 +279,12 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                                 },
                                 actions = {
                                     // Diff stats badge
-                                    if (cwd != null && selectedGitStatus != null) {
+                                    if (selectedThreadDiffTotals != null) {
                                         DiffStatsBadge(
-                                            gitStatus = selectedGitStatus,
+                                            additions = selectedThreadDiffTotals.additions,
+                                            deletions = selectedThreadDiffTotals.deletions,
                                             onClick = {
-                                                viewModel.gitDiff(cwd)
-                                                showDiffSheet = true
+                                                showThreadDiffSheet = true
                                             },
                                         )
                                     }
@@ -651,7 +661,7 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                         onDiff = {
                             cwd?.let {
                                 viewModel.gitDiff(it)
-                                showDiffSheet = true
+                                showRepoDiffSheet = true
                             }
                         },
                         onDiscard = { /* TODO: implement discard */ },
@@ -666,12 +676,24 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
                 }
 
                 // Diff sheet
-                if (showDiffSheet) {
+                if (showRepoDiffSheet) {
                     GitDiffSheet(
+                        title = "Repository Changes",
                         patch = viewModel.diffResult?.patch,
                         onDismiss = {
-                            showDiffSheet = false
+                            showRepoDiffSheet = false
                             viewModel.clearDiffResult()
+                        },
+                    )
+                }
+
+                if (showThreadDiffSheet) {
+                    GitDiffSheet(
+                        title = "Conversation Changes",
+                        chunks = selectedThreadDiffChunks,
+                        emptyLabel = "No conversation changes",
+                        onDismiss = {
+                            showThreadDiffSheet = false
                         },
                     )
                 }
@@ -731,6 +753,30 @@ fun RemodexApp(viewModel: RemodexAppViewModel) {
             }
         }
     }
+}
+
+private fun resolveSelectedGitStatus(
+    selectedThread: com.remodex.android.core.model.ThreadSummary?,
+    threads: List<com.remodex.android.core.model.ThreadSummary>,
+    gitStatusByThread: Map<String, com.remodex.android.core.model.GitRepoSyncResult>,
+    fallbackGitStatus: com.remodex.android.core.model.GitRepoSyncResult?,
+): com.remodex.android.core.model.GitRepoSyncResult? {
+    val selectedThreadId = selectedThread?.id
+    if (selectedThreadId != null) {
+        gitStatusByThread[selectedThreadId]?.let { return it }
+    }
+
+    val selectedCwd = selectedThread?.cwd?.trimEnd('/') ?: return fallbackGitStatus
+    val siblingThreadIds = threads
+        .asSequence()
+        .filter { thread -> thread.cwd?.trimEnd('/') == selectedCwd }
+        .map { thread -> thread.id }
+        .toSet()
+
+    return gitStatusByThread.entries
+        .firstOrNull { (threadId, _) -> threadId in siblingThreadIds }
+        ?.value
+        ?: fallbackGitStatus
 }
 
 private suspend fun loadComposerAttachmentsFromUris(

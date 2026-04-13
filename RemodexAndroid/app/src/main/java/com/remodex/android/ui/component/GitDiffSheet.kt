@@ -57,19 +57,28 @@ private val DiffBlue = Color(0xFF60A5FA)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun GitDiffSheet(
-    patch: String?,
+    title: String = "Repository Changes",
+    patch: String? = null,
+    chunks: List<DiffFileChunk> = emptyList(),
+    emptyLabel: String = "No changes",
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val chunks = remember(patch) {
-        if (patch.isNullOrBlank()) emptyList() else splitUnifiedDiffByFile(patch)
+    val resolvedChunks = remember(patch, chunks) {
+        if (chunks.isNotEmpty()) {
+            chunks
+        } else if (!patch.isNullOrBlank()) {
+            splitUnifiedDiffByFile(patch)
+        } else {
+            emptyList()
+        }
     }
     val expandedFiles = remember { mutableStateMapOf<String, Boolean>() }
-    val allExpanded = chunks.isNotEmpty() && chunks.all { expandedFiles[it.path] == true }
+    val allExpanded = resolvedChunks.isNotEmpty() && resolvedChunks.all { expandedFiles[it.path] == true }
 
     // Default to all expanded on first show
-    if (expandedFiles.isEmpty() && chunks.isNotEmpty()) {
-        chunks.forEach { expandedFiles[it.path] = true }
+    if (expandedFiles.isEmpty() && resolvedChunks.isNotEmpty()) {
+        resolvedChunks.forEach { expandedFiles[it.path] = true }
     }
 
     ModalBottomSheet(
@@ -88,7 +97,7 @@ fun GitDiffSheet(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "Repository Changes",
+                    title,
                     style = MaterialTheme.typography.titleMedium,
                 )
                 TextButton(onClick = onDismiss) {
@@ -96,10 +105,10 @@ fun GitDiffSheet(
                 }
             }
 
-            if (chunks.isEmpty()) {
+            if (resolvedChunks.isEmpty()) {
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "No changes",
+                    emptyLabel,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -114,7 +123,7 @@ fun GitDiffSheet(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        "${chunks.size} file${if (chunks.size == 1) "" else "s"} changed",
+                        "${resolvedChunks.size} file${if (resolvedChunks.size == 1) "" else "s"} changed",
                         style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -122,7 +131,7 @@ fun GitDiffSheet(
                         if (allExpanded) {
                             expandedFiles.keys.forEach { expandedFiles[it] = false }
                         } else {
-                            chunks.forEach { expandedFiles[it.path] = true }
+                            resolvedChunks.forEach { expandedFiles[it.path] = true }
                         }
                     }) {
                         Text(
@@ -138,7 +147,7 @@ fun GitDiffSheet(
                     modifier = Modifier.weight(1f, fill = false),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    items(chunks, key = { it.path }) { chunk ->
+                    items(resolvedChunks, key = { it.path }) { chunk ->
                         val isExpanded = expandedFiles[chunk.path] == true
                         DiffFileCard(
                             chunk = chunk,
