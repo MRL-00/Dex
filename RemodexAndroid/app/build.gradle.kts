@@ -6,11 +6,11 @@ plugins {
 }
 
 android {
-    namespace = "com.remodex.android"
+    namespace = "com.mattl_nz.dex"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.remodex.android"
+        applicationId = "com.mattl_nz.dex"
         minSdk = 28
         targetSdk = 35
         versionCode = 1
