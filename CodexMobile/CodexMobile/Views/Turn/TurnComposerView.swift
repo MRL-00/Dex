@@ -134,10 +134,16 @@ struct TurnComposerView: View {
                     )
                     .frame(height: composerInputHeight)
                 }
+                .frame(minHeight: composerInputHeight + 8, alignment: .topLeading)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 16)
                 .padding(.top, accessoryState.topInputPadding + 4)
                 .padding(.bottom, 14)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    guard !isComposerInteractionLocked else { return }
+                    isInputFocused.wrappedValue = true
+                }
                 .onChange(of: input) { _, newValue in
                     onInputChangedForFileAutocomplete(newValue)
                     onInputChangedForSkillAutocomplete(newValue)
