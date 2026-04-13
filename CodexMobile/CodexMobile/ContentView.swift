@@ -24,9 +24,16 @@ struct ContentView: View {
     @State private var isShowingManualScanner = false
     @State private var hasDismissedAutomaticScanner = false
     @State private var scannerCanReturnToOnboarding = false
+    @State private var isShowingManualPairingEntry = false
+    @State private var manualPairingCode = ""
+    @State private var manualPairingErrorMessage: String?
+    @State private var isResolvingManualPairingCode = false
     @State private var isSearchActive = false
     @State private var isRetryingBridgeUpdate = false
     @State private var isPreparingManualScanner = false
+    @State private var isWakingSavedMacDisplay = false
+    @State private var hasAttemptedAutomaticWakeSavedMacDisplay = false
+    @State private var shouldShowWakeSavedMacDisplayButton = false
     @State private var threadCompletionBannerDismissTask: Task<Void, Never>?
     @State private var sidebarPrewarmTask: Task<Void, Never>?
     @State private var sidebarGestureDebugSequence = 0
@@ -41,6 +48,7 @@ struct ContentView: View {
     private let sidebarPrewarmDelayNanoseconds: UInt64 = 700_000_000
     private let sidebarGestureLogBucketWidth: CGFloat = 40
     private let sidebarSwipeCommitDistance: CGFloat = 30
+    private let wakingSavedMacDisplayStatusMessage = "Trying to wake your Mac display..."
     private static let sidebarSpring = Animation.spring(response: 0.35, dampingFraction: 0.85)
 
     var body: some View {
@@ -117,30 +125,35 @@ struct ContentView: View {
                             return
                         }
 
-                        await viewModel.attemptAutoReconnectOnForegroundIfNeeded(codex: codex)
+                        await attemptSavedMacReconnectRecoveryIfNeeded()
                         await subscriptionRefresh
                         scheduleSidebarPrewarmIfNeeded()
                     }
                 } else if phase == .background {
+                    resetSavedMacWakeRecoveryState()
                     teardownSidebarPrewarm()
                 }
             }
             .onChange(of: codex.shouldAutoReconnectOnForeground) { _, shouldReconnect in
-                guard shouldReconnect, scenePhase == .active, hasSeenOnboarding, !isShowingManualScanner else {
+                guard shouldReconnect else {
                     return
                 }
                 Task {
-                    await viewModel.attemptAutoReconnectOnForegroundIfNeeded(codex: codex)
+                    await attemptSavedMacReconnectRecoveryIfNeeded()
                 }
             }
             .onChange(of: codex.isConnected) { wasConnected, isNowConnected in
                 debugSidebarLog("connection changed wasConnected=\(wasConnected) isConnected=\(isNowConnected)")
                 if !wasConnected, isNowConnected {
+                    resetSavedMacWakeRecoveryState()
                     Task {
                         await codex.requestNotificationPermissionOnFirstLaunchIfNeeded()
                     }
                     scheduleSidebarPrewarmIfNeeded()
                 }
+            }
+            .onChange(of: codex.normalizedRelaySessionId) { _, _ in
+                resetSavedMacWakeRecoveryState()
             }
             .onChange(of: codex.threadCompletionBanner) { _, banner in
                 scheduleThreadCompletionBannerDismiss(for: banner)
@@ -182,6 +195,31 @@ struct ContentView: View {
                 }
             } message: { _ in
                 Text("This chat is no longer available. Start a new chat instead?")
+            }
+            .alert("Pairing Error", isPresented: Binding(
+                get: { manualPairingErrorMessage != nil },
+                set: { if !$0 { manualPairingErrorMessage = nil } }
+            )) {
+                Button("OK", role: .cancel) {
+                    manualPairingErrorMessage = nil
+                }
+            } message: {
+                Text(manualPairingErrorMessage ?? "Could not resolve that pairing code.")
+            }
+            .alert("Enter Pairing Code", isPresented: $isShowingManualPairingEntry) {
+                TextField("AB23CD34EF", text: $manualPairingCode)
+                    .textInputAutocapitalization(.characters)
+                    .autocorrectionDisabled()
+
+                Button(isResolvingManualPairingCode ? "Connecting..." : "Enter") {
+                    submitManualPairingCode()
+                }
+
+                Button("Cancel", role: .cancel) {
+                    manualPairingCode = ""
+                }
+            } message: {
+                Text("Paste the pairing code shown in the terminal on your Mac or in your phone shell.")
             }
             .overlay(alignment: .top) {
                 if let banner = codex.threadCompletionBanner {
@@ -339,6 +377,8 @@ struct ContentView: View {
                         await viewModel.toggleConnection(codex: codex)
                     }
                 })
+                .environment(\.wakeMacDisplayAction, wakeMacDisplayRecoveryAction)
+                .environment(\.isWakingMacDisplayRecovery, isWakingSavedMacDisplay)
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
                         hamburgerButton
@@ -363,22 +403,23 @@ struct ContentView: View {
                 }
             ) {
                 if homeConnectionPhase == .connecting || (codex.hasReconnectCandidate && !codex.isConnected) {
-                    Button("Scan New QR Code") {
-                        presentManualScannerAfterStoppingReconnect()
-                    }
-                    .font(AppFont.subheadline(weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .buttonStyle(.plain)
-                    .disabled(isPreparingManualScanner)
-
-                    if codex.hasReconnectCandidate {
-                        Button("Forget Pair") {
-                            codex.forgetReconnectCandidate()
+                    if shouldOfferWakeSavedMacDisplayAction {
+                        Button(isWakingSavedMacDisplay ? "Waking Mac Screen..." : "Wake Mac Screen") {
+                            wakeSavedMacDisplay()
                         }
                         .font(AppFont.subheadline(weight: .semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.primary)
                         .buttonStyle(.plain)
+                        .disabled(isPreparingManualScanner || isWakingSavedMacDisplay)
                     }
+
+                    if codex.hasReconnectCandidate {
+                        reconnectSecondaryActions
+                    }
+                }
+            } footer: {
+                if codex.hasReconnectCandidate && !codex.isConnected {
+                    reconnectFooterAction
                 }
             }
             .toolbar {
@@ -402,6 +443,109 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Menu")
+    }
+
+    // Offers a one-tap display wake only for saved local-style relays where the Mac may still be alive.
+    private var canWakeSavedMacDisplay: Bool {
+        guard homeConnectionPhase == .offline,
+              !codex.isConnected,
+              codex.secureConnectionState != .rePairRequired,
+              codex.hasSavedRelaySession,
+              let relayURL = codex.normalizedRelayURL,
+              let url = URL(string: relayURL) else {
+            return false
+        }
+
+        return codex.prefersDirectRelayTransport(for: url)
+    }
+
+    // Unlocks the visible wake CTA only after the silent auto-wake fallback already had one chance.
+    private var shouldOfferWakeSavedMacDisplayAction: Bool {
+        canWakeSavedMacDisplay && shouldShowWakeSavedMacDisplayButton
+    }
+
+    // Keeps the wake fallback automatic exactly once per offline cycle before escalating to the button.
+    private var shouldAttemptAutomaticWakeSavedMacDisplay: Bool {
+        scenePhase == .active
+            && hasSeenOnboarding
+            && !isShowingManualScanner
+            && !isShowingManualPairingEntry
+            && codex.shouldAutoReconnectOnForeground
+            && canWakeSavedMacDisplay
+            && !shouldShowWakeSavedMacDisplayButton
+            && !hasAttemptedAutomaticWakeSavedMacDisplay
+            && !isWakingSavedMacDisplay
+    }
+
+    private var wakeMacDisplayRecoveryAction: (() -> Void)? {
+        guard shouldOfferWakeSavedMacDisplayAction else {
+            return nil
+        }
+
+        return {
+            wakeSavedMacDisplay()
+        }
+    }
+
+    // Gives the saved local Mac one silent wake attempt before exposing the manual wake affordance.
+    private func attemptAutomaticWakeSavedMacDisplayIfNeeded() async {
+        guard shouldAttemptAutomaticWakeSavedMacDisplay else {
+            return
+        }
+
+        hasAttemptedAutomaticWakeSavedMacDisplay = true
+        shouldShowWakeSavedMacDisplayButton = false
+        await performSavedMacDisplayWakeAttempt()
+    }
+
+    // Keeps foreground reconnect and the one-shot wake fallback in the same guarded path.
+    private func attemptSavedMacReconnectRecoveryIfNeeded() async {
+        guard scenePhase == .active,
+              hasSeenOnboarding,
+              !isShowingManualScanner,
+              !isShowingManualPairingEntry else {
+            return
+        }
+
+        await attemptAutomaticWakeSavedMacDisplayIfNeeded()
+        await viewModel.attemptAutoReconnectOnForegroundIfNeeded(codex: codex)
+    }
+
+    // Resets the once-per-cycle wake gate after a fresh connection, pairing change, or app background.
+    private func resetSavedMacWakeRecoveryState() {
+        hasAttemptedAutomaticWakeSavedMacDisplay = false
+        shouldShowWakeSavedMacDisplayButton = false
+    }
+
+    // Uses a temporary bridge request to wake display sleep, then unlocks the manual button only if that fails.
+    private func wakeSavedMacDisplay() {
+        Task { @MainActor in
+            await performSavedMacDisplayWakeAttempt()
+        }
+    }
+
+    // Sends one wake pulse over the saved pairing path and leaves the manual CTA hidden unless recovery still fails.
+    private func performSavedMacDisplayWakeAttempt() async {
+        guard !isWakingSavedMacDisplay else { return }
+        isWakingSavedMacDisplay = true
+        codex.lastErrorMessage = wakingSavedMacDisplayStatusMessage
+
+        defer { isWakingSavedMacDisplay = false }
+
+        do {
+            await viewModel.stopAutoReconnectForManualRetry(codex: codex)
+            let handoffService = DesktopHandoffService(codex: codex)
+            try await handoffService.wakeDisplay()
+            shouldShowWakeSavedMacDisplayButton = false
+            if codex.lastErrorMessage == wakingSavedMacDisplayStatusMessage {
+                codex.lastErrorMessage = nil
+            }
+        } catch {
+            if canWakeSavedMacDisplay {
+                shouldShowWakeSavedMacDisplayButton = true
+            }
+            codex.lastErrorMessage = error.localizedDescription
+        }
     }
 
     // MARK: - Sidebar Geometry
@@ -753,7 +897,7 @@ struct ContentView: View {
         presentManualScannerAfterStoppingReconnect()
     }
 
-    // Shows the QR scanner immediately and tears down any stale reconnect in the background.
+    // Shows pairing recovery immediately and tears down any stale reconnect in the background.
     private func presentManualScannerAfterStoppingReconnect() {
         guard !isShowingManualScanner else {
             return
@@ -795,6 +939,98 @@ struct ContentView: View {
             hasDismissedAutomaticScanner = false
             scannerCanReturnToOnboarding = false
             hasSeenOnboarding = false
+        }
+    }
+
+    // Keeps QR and code recovery as one quiet secondary row under the main reconnect CTA.
+    private var reconnectSecondaryActions: some View {
+        HStack(spacing: 10) {
+            secondaryReconnectActionButton("New QR Code") {
+                presentManualScannerAfterStoppingReconnect()
+            }
+            .disabled(isPreparingManualScanner)
+
+            secondaryReconnectActionButton("Pair with Code") {
+                presentManualPairingEntryAfterStoppingReconnect()
+            }
+            .disabled(isPreparingManualScanner || isResolvingManualPairingCode)
+        }
+    }
+
+    // Keeps the destructive saved-pair action visually separate from the reconnect controls.
+    private var reconnectFooterAction: some View {
+        Button("Forget Pair") {
+            codex.forgetReconnectCandidate()
+        }
+        .font(AppFont.caption(weight: .semibold))
+        .foregroundStyle(.secondary)
+        .buttonStyle(.plain)
+    }
+
+    // Mirrors the reconnect button corner language in a lighter outline-only treatment.
+    private func secondaryReconnectActionButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(AppFont.subheadline(weight: .semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+        }
+        .foregroundStyle(.primary)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+        )
+        .buttonStyle(.plain)
+    }
+
+    // Opens manual code entry directly from the home state so the scanner stays QR-only.
+    private func presentManualPairingEntryAfterStoppingReconnect() {
+        guard !isResolvingManualPairingCode else {
+            return
+        }
+
+        manualPairingErrorMessage = nil
+        let clipboardString = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !clipboardString.isEmpty {
+            manualPairingCode = clipboardString
+        }
+        isShowingManualPairingEntry = true
+
+        Task {
+            await viewModel.stopAutoReconnectForManualScan(codex: codex)
+        }
+    }
+
+    private func submitManualPairingCode() {
+        guard !isResolvingManualPairingCode else {
+            return
+        }
+
+        let pendingCode = manualPairingCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pendingCode.isEmpty else {
+            manualPairingErrorMessage = "Enter a valid pairing code."
+            return
+        }
+        isResolvingManualPairingCode = true
+        manualPairingErrorMessage = nil
+
+        Task { @MainActor in
+            defer { isResolvingManualPairingCode = false }
+
+            await viewModel.stopAutoReconnectForManualScan(codex: codex)
+
+            do {
+                let pairingPayload = try await codex.resolvePairingCode(pendingCode)
+                isShowingManualPairingEntry = false
+                manualPairingCode = ""
+                await viewModel.connectToRelay(
+                    pairingPayload: pairingPayload,
+                    codex: codex
+                )
+            } catch {
+                manualPairingErrorMessage = error.localizedDescription
+            }
         }
     }
 

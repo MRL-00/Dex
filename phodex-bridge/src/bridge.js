@@ -43,6 +43,7 @@ const {
   buildIOSAppCompatibilitySnapshot,
   normalizeVersionString,
 } = require("./ios-app-compatibility");
+const { createShortPairingCode, SHORT_PAIRING_CODE_LENGTH } = require("./qr");
 
 const execFileAsync = promisify(execFile);
 const RELAY_WATCHDOG_PING_INTERVAL_MS = 10_000;
@@ -53,7 +54,7 @@ const RELAY_HISTORY_IMAGE_REFERENCE_URL = "remodex://history-image-elided";
 function startBridge({
   config: explicitConfig = null,
   printPairingQr = true,
-  onPairingPayload = null,
+  onPairingSession = null,
   onBridgeStatus = null,
 } = {}) {
   const config = explicitConfig || readBridgeConfig();
@@ -114,6 +115,7 @@ function startBridge({
   let lastRelayActivityAt = 0;
   let lastPublishedBridgeStatus = null;
   let lastConnectionStatus = null;
+  let codexLaunchState = config.codexEndpoint ? "connected" : "starting";
   let codexHandshakeState = config.codexEndpoint ? "warm" : "cold";
   const forwardedInitializeRequestIds = new Set();
   const bridgeManagedCodexRequestWaiters = new Map();
@@ -167,6 +169,7 @@ function startBridge({
   const codex = createCodexTransport({
     endpoint: config.codexEndpoint,
     env: process.env,
+    appPath: config.codexAppPath,
     logPrefix: "[remodex]",
   });
   const voiceHandler = createVoiceHandler({
@@ -182,6 +185,7 @@ function startBridge({
   });
 
   codex.onError((error) => {
+    codexLaunchState = "error";
     publishBridgeStatus({
       state: "error",
       connectionStatus: "error",
@@ -197,6 +201,15 @@ function startBridge({
     }
     console.error(error.message);
     process.exit(1);
+  });
+  // Marks the local Codex runtime as launchable before relay/network recovery updates.
+  codex.onStarted(() => {
+    codexLaunchState = "connected";
+    if (!lastPublishedBridgeStatus) {
+      return;
+    }
+
+    publishBridgeStatus(lastPublishedBridgeStatus);
   });
 
   function clearReconnectTimer() {
@@ -334,7 +347,7 @@ function startBridge({
       headers: {
         "x-role": "mac",
         "x-notification-secret": notificationSecret,
-        ...buildMacRegistrationHeaders(deviceState),
+        ...buildMacRegistrationHeaders(deviceState, pairingSession),
       },
     });
     socket = nextSocket;
@@ -397,9 +410,13 @@ function startBridge({
   }
 
   const pairingPayload = secureTransport.createPairingPayload();
-  onPairingPayload?.(pairingPayload);
+  const pairingSession = {
+    pairingPayload,
+    pairingCode: createShortPairingCode({ length: SHORT_PAIRING_CODE_LENGTH }),
+  };
+  onPairingSession?.(pairingSession);
   if (printPairingQr) {
-    printQR(pairingPayload);
+    printQR(pairingSession);
   }
   pushServiceClient.logUnavailable();
   connectRelay();
@@ -1020,8 +1037,12 @@ function startBridge({
   }
 
   function publishBridgeStatus(status) {
-    lastPublishedBridgeStatus = status;
-    onBridgeStatus?.(status);
+    const nextStatus = {
+      ...status,
+      codexLaunchState,
+    };
+    lastPublishedBridgeStatus = nextStatus;
+    onBridgeStatus?.(nextStatus);
   }
 
   // Refreshes the relay's trusted-mac index after the QR bootstrap locks in a phone identity.
@@ -1033,18 +1054,21 @@ function startBridge({
 
     socket.send(JSON.stringify({
       kind: "relayMacRegistration",
-      registration: buildMacRegistration(nextDeviceState),
+      registration: buildMacRegistration(nextDeviceState, pairingSession),
     }));
   }
 }
 
 // Registers the canonical Mac identity and the one trusted iPhone allowed for auto-resolve.
-function buildMacRegistrationHeaders(deviceState) {
-  const registration = buildMacRegistration(deviceState);
+function buildMacRegistrationHeaders(deviceState, pairingSession) {
+  const registration = buildMacRegistration(deviceState, pairingSession);
   const headers = {
     "x-mac-device-id": registration.macDeviceId,
     "x-mac-identity-public-key": registration.macIdentityPublicKey,
     "x-machine-name": registration.displayName,
+    "x-pairing-code": registration.pairingCode,
+    "x-pairing-version": registration.pairingVersion ? String(registration.pairingVersion) : "",
+    "x-pairing-expires-at": registration.pairingExpiresAt ? String(registration.pairingExpiresAt) : "",
   };
   if (registration.trustedPhoneDeviceId && registration.trustedPhonePublicKey) {
     headers["x-trusted-phone-device-id"] = registration.trustedPhoneDeviceId;
@@ -1053,7 +1077,7 @@ function buildMacRegistrationHeaders(deviceState) {
   return headers;
 }
 
-function buildMacRegistration(deviceState) {
+function buildMacRegistration(deviceState, pairingSession) {
   const trustedPhoneEntry = Object.entries(deviceState?.trustedPhones || {})[0] || null;
   return {
     macDeviceId: normalizeNonEmptyString(deviceState?.macDeviceId),
@@ -1061,6 +1085,11 @@ function buildMacRegistration(deviceState) {
     displayName: normalizeNonEmptyString(os.hostname()),
     trustedPhoneDeviceId: normalizeNonEmptyString(trustedPhoneEntry?.[0]),
     trustedPhonePublicKey: normalizeNonEmptyString(trustedPhoneEntry?.[1]),
+    pairingCode: normalizeNonEmptyString(pairingSession?.pairingCode),
+    pairingVersion: Number.isInteger(pairingSession?.pairingPayload?.v) ? pairingSession.pairingPayload.v : 0,
+    pairingExpiresAt: Number.isFinite(pairingSession?.pairingPayload?.expiresAt)
+      ? pairingSession.pairingPayload.expiresAt
+      : 0,
   };
 }
 
